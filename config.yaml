@@ -29,6 +29,14 @@ civs:
       template: "{root}·{clan}"                              # 组合模板（支持 {prefix}/{root}/{suffix}/{clan}/{ordinal}）
       style_note: 海民命名喜航海与海兽意象，常以氏族连名，音节短促有力
       gendered: false
+    voice:                                                       # 官方文风（按体裁），可演化
+      general: 庄重尚武，简劲如海风
+      by_genre:
+        chronicle: 以海象与潮汛纪年，记酋长功业与航海事，简劲尚武
+        decree: 诏令以海灵名义起首，语气刚直，多涉航海与战备
+        scripture: 经文多颂海灵与鲸神，语带潮汐韵律
+        diary: 日记口语化，常提渔获、海况、出海见闻
+        minutes: 议事纪要条目化，多议航海、分配、战备
   - id: verdia
     name: 翠地亚
     biome: plains
@@ -50,6 +58,14 @@ civs:
       template: "{root}·{clan}"
       style_note: 农耕民命名尚土地与谷物意象，多以职业或氏族连名，质朴平和
       gendered: false
+    voice:
+      general: 质朴平和，厚土气息
+      by_genre:
+        chronicle: 以节气与丰歉纪年，记农事、祭祖、氏族事，质朴平和
+        decree: 长老令语气恳切，多涉农时、分田、祭典
+        scripture: 经文颂地母与谷灵，语带泥土与生长意象
+        diary: 日记口语化，常提天气、农活、收成、邻里
+        minutes: 议事纪要条目化，多议农时、水源、祭祖分配
 
 # Initial diplomatic stance matrix (optional; missing pairs default to neutral).
 relations:

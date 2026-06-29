@@ -1,5 +1,5 @@
 """
-人物命名与社会身份生成（civsim.naming）。
+人物命名、社会身份与官方文风生成（civsim.naming）。
 
 本模块是「LLM 即兴生成 + 结构化规范约束」的接合点：
 
@@ -9,8 +9,11 @@
 - :class:`RoleProposer` 在关键事件时调 LLM 提议契合文明现状的新社会身份头衔
   （如「角斗士」「行会首脑」），并指明其所属核心阶层；引擎校验阶层合法后
   加入文明 ``role_pool``。这让文明的社会结构随时间涌现、可见地增长。
+- :class:`VoiceReformer` 在关键事件时调 LLM 提议官方文风微调（如「共和后编年史
+  去颂圣、记公民议」），引擎采纳后更新 ``VoiceStyle`` 并写 ``Fact``，使同系列文本
+  风格连贯、文风变迁成为可见文明史。
 
-两套生成器都走 :class:`~civsim.providers.LLMProvider`，故换后端无需改本模块。
+三套生成器都走 :class:`~civsim.providers.LLMProvider`，故换后端无需改本模块。
 """
 
 from __future__ import annotations
@@ -18,7 +21,7 @@ from __future__ import annotations
 import random
 from typing import Optional
 
-from .models import Civilization, NamingStyle, SocialClass
+from .models import Civilization, NamingStyle, SocialClass, VoiceStyle
 from .providers import GenRequest, LLMProvider
 
 
@@ -199,3 +202,85 @@ class RoleProposer:
                     break
                 out.append((r, sc))
         return out[:count]
+
+
+# ---------------------------------------------------------------------------
+# 官方文风演化
+# ---------------------------------------------------------------------------
+
+
+# mock 模式按触发关键词给的兜底文风候选：trigger -> {genre: 笔法说明}。
+# 与 RoleProposer 的兜底同思路：关键事件触发，按情境给契合的文风微调。
+_MOCK_VOICE_CANDIDATES: dict[str, dict[str, str]] = {
+    "gov_monarchy": {"chronicle": "纪事尚王统，多载即位、封赏、征伐", "decree": "诏令称奉天承运，语气威严"},
+    "gov_republic": {"chronicle": "纪事去颂圣，载公民议、公决、法令", "decree": "政令以议事会名义颁，语气平实"},
+    "gov_theocracy": {"chronicle": "纪事多引神谕、圣迹，语带敬畏", "scripture": "经文加重，多言审判与救赎"},
+    "gov_empire": {"chronicle": "纪事尚武功，载行省、军团、征服", "decree": "诏令以皇帝名义，语气雄浑"},
+    "tech_bronze": {"decree": "诏令多涉铸器、矿冶之政"},
+    "tech_iron": {"decree": "诏令多涉兵器、甲胄之政"},
+    "tech_renaissance": {"chronicle": "纪事兼载学术、星象、游历", "minutes": "议事纪要渐涉度量、测绘"},
+    "tech_industrial": {"chronicle": "纪事载工场、机巧、商路", "minutes": "议事纪要涉工场、税制"},
+    "religion": {"scripture": "经文转向新宗意象", "chronicle": "纪事载宗教变革与信徒动向"},
+}
+
+
+class VoiceReformer:
+    """在关键事件时提议官方文风微调。
+
+    LLM 提议契合新阶段的文风调整（体裁→笔法说明），引擎采纳后更新 ``civ.voice``
+    并写 ``Fact(kind="voice_reform")``。mock 模式按触发关键词给固定候选，零配置可跑。
+
+    设计意图：同系列文本（如某文明历年编年史）风格连贯，而非每篇 LLM 自由发挥；
+    文风随时代微调，变迁本身成为可见文明史。
+    """
+
+    # 文风微调触及的体裁集合（限定 LLM 输出范围，避免乱改无关体裁）。
+    GENRES = ("chronicle", "diary", "decree", "scripture", "minutes")
+
+    def __init__(self, provider: LLMProvider, rng: random.Random | None = None):
+        self.provider = provider
+        self.rng = rng or random.Random()
+
+    def propose(self, civ: Civilization, trigger: str) -> dict[str, str]:
+        """提议文风微调，返回 {genre: 新笔法说明}（可能为空 dict 表示无需调整）。
+
+        ``trigger`` 形如 ``"gov_republic"``/``"tech_bronze"``。返回的 key 必在
+        :attr:`GENRES` 内，引擎据此更新 ``civ.voice.by_genre``。
+        """
+        if self.provider.name == "mock":
+            cands = _MOCK_VOICE_CANDIDATES.get(trigger, {})
+            # mock 下随机选 1-2 个体裁的微调，模拟「不是每次都全改」。
+            items = list(cands.items())
+            self.rng.shuffle(items)
+            return dict(items[: self.rng.randint(1, max(1, len(items)))]) if items else {}
+        return self._llm_propose(civ, trigger)
+
+    def _llm_propose(self, civ: Civilization, trigger: str) -> dict[str, str]:
+        """调 LLM 提议文风微调，结构化返回。要求每行『体裁|新笔法说明』。"""
+        current = "; ".join(f"{g}:{v}" for g, v in civ.voice.by_genre.items()) or civ.voice.general
+        user = (
+            f"文明：{civ.name}（政体={civ.government.value}，科技={civ.tech_level.name}，"
+            f"信仰={civ.religion}）。\n"
+            f"触发情境：{trigger}（政体更替/科技升级/宗教变革）。\n"
+            f"当前文风：{current}\n"
+            f"请提议契合新阶段的官方文风微调，从这些体裁中选：{list(self.GENRES)}。\n"
+            f"只对需调整的体裁给出新笔法说明，格式：每行『体裁|新笔法说明』，不要编号、不要解释。\n"
+            f"若无调整必要，输出空。"
+        )
+        raw = self.provider.generate(GenRequest(
+            system="你是文风审定者。提议契合文明新历史阶段的官方文风微调，"
+                   "笔法说明应具体可执行（如『纪事去颂圣、载公民议』），保留该文明一贯气质。"
+                   "严格按格式输出。",
+            user=user, context_docs=[], max_tokens=180,
+        ))
+        out: dict[str, str] = {}
+        valid = set(self.GENRES)
+        for line in raw.splitlines():
+            if "|" not in line:
+                continue
+            genre, _, note = line.strip().partition("|")
+            genre = genre.strip().lower()
+            note = note.strip().lstrip("0123456789.、-) ").strip()
+            if genre in valid and note:
+                out[genre] = note
+        return out

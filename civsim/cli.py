@@ -29,7 +29,7 @@ from .archive import Archive
 from .engine import Simulation
 from .models import (
     Biome, Civilization, Era, Event, Government, NamingStyle, Relation,
-    SocialClass, TechLevel, World,
+    SocialClass, TechLevel, VoiceStyle, World,
 )
 from .providers import get_provider, get_provider_from_config
 
@@ -75,6 +75,10 @@ def build_world(cfg_path: str) -> World:
             ),
             social_classes=[SocialClass(s) for s in c.get("social_classes", ["commoner"])],
             role_pool=c.get("role_pool", []),
+            voice=VoiceStyle(
+                general=voice_cfg.get("general", "庄重质朴"),
+                by_genre=voice_cfg.get("by_genre", {}),
+            ) if (voice_cfg := c.get("voice")) else VoiceStyle(),
         ))
     # 应用外交关系矩阵：双向写入。
     for a, b, rel in cfg.get("relations", []):

@@ -128,6 +128,26 @@ class NamingStyle(BaseModel):
     gendered: bool = False                                # 是否区分性别用名
 
 
+class VoiceStyle(BaseModel):
+    """一个文明的官方文风 —— 按体裁记录笔法特征，保证同系列文本风格连贯。
+
+    没有 VoiceStyle 时，每次生成都独立 prompt、LLM 自由发挥，同一文明隔几个 tick 的
+    编年史可能一会儿文言一会儿白话。VoiceStyle 把「这个文明的编年史一贯是什么腔调」
+    固化下来，生成时注入 prompt 约束；关键事件时由 LLM 提议微调并写
+    ``Fact(kind="voice_reform")``，文风变迁本身也成为可见文明史。
+
+    ``by_genre`` 的 key 取自 archive.Genres（chronicle/diary/decree/scripture/minutes）。
+    ``for_genre`` 取某体裁文风，缺省回退到 ``general``。
+    """
+
+    general: str = "庄重质朴"                              # 总体文风一句话
+    by_genre: dict[str, str] = Field(default_factory=dict)  # 体裁→笔法说明
+
+    def for_genre(self, genre: str) -> str:
+        """取某体裁的笔法说明；缺省回退到 general。"""
+        return self.by_genre.get(genre) or self.general
+
+
 class Person(BaseModel):
     """重要人物。每个文明只维护少数几位，用于给叙事提供「角色」。
 
@@ -173,6 +193,7 @@ class Civilization(BaseModel):
     naming: NamingStyle = Field(default_factory=NamingStyle)  # 命名规范，可演化（见 naming.NameGenerator）
     social_classes: list[SocialClass] = Field(default_factory=lambda: [SocialClass.COMMONER])  # 已解锁核心阶层
     role_pool: list[str] = Field(default_factory=list)  # 已涌现的具体身份头衔（LLM 提议扩充），spawn 时抽取
+    voice: VoiceStyle = Field(default_factory=VoiceStyle)  # 官方文风（按体裁），可演化（见 naming.VoiceReformer）
     # --- 外交：对方 civ_id -> 本文明对其的立场 ---
     relations: dict[str, Relation] = Field(default_factory=dict)  # engine._diplomacy_tick 维护
     # --- 人物 ---
@@ -224,6 +245,7 @@ class Fact(BaseModel):
     - 政体更替：某文明某年改共和 → 不得再写其为君主。
     - 命名变革（naming_reform）：某文明某年改用……命名。
     - 身份涌现（role_emergence）：某文明某年出现『角斗士』这一身份。
+    - 文风变革（voice_reform）：某文明某年编年史笔法改为……。
 
     ``scope`` 给出生效范围；``holds_until`` 留给"暂时性事实"（如停战），
     永久事实为 None。

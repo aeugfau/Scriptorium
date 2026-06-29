@@ -42,6 +42,7 @@ class ArtifactFactory:
             f"粮储{c.food:.0f} 财富{c.wealth:.0f} 科技={c.tech_level.name}({c.tech_progress:.0f}) "
             f"政体={c.government.value} 信仰={c.religion} 稳定{c.stability:.0f} "
             f"外交:{rels} 命名风格:{c.naming.style_note or '朴素'} "
+            f"文风:{c.voice.general} "
             f"社会阶层:{[s.value for s in c.social_classes]} 名人:{people}"
         )
 
@@ -73,15 +74,38 @@ class ArtifactFactory:
         优先取本篇涉及事件中 magnitude 最大的年份；无事件则取区间中点
         （prev_year + w.year）/ 2。这样日记/诏令标题的年份落在真实历史内，
         而非永远卡在 tick 末年份（25/50/75）。
+
+        注意：仅编年史（综述整段）用本方法锚定末年；日记/诏令/经文/会议纪要改用
+        :meth:`_year_in_span` 各自从区间内随机取年，避免「同 tick 多篇都撞同一年」。
         """
         if events:
             return max(events, key=lambda e: e.magnitude).year
         # 区间中点：本 tick 覆盖 [w.year-years_per_tick, w.year]。
         return (w.year - w.years_per_tick + w.year) // 2
 
+    def _year_in_span(self, w: World) -> int:
+        """从本 tick 区间 ``[w.year-years_per_tick, w.year]`` 内随机取一年。
+
+        日记是某天的、诏令是某天的——它们本就该落在区间内不同年份，而非共用一个
+        focal year 造成「同一年冒出 5 篇文档」的不自然。用 ``self.rng``，可复现。
+        """
+        lo = w.year - w.years_per_tick
+        hi = w.year
+        return self.rng.randint(lo, hi)
+
     # -- per-genre generators ---------------------------------------------
 
-    def _gen(self, system: str, user: str, context_docs: list[str], max_tokens: int = 900) -> str:
+    def _gen(self, system: str, user: str, context_docs: list[str], max_tokens: int = 900,
+             civ: Optional[Civilization] = None, genre: Optional[str] = None) -> str:
+        """调 provider 生成文本。若传入 ``civ`` 与 ``genre``，注入该文明该体裁的官方文风。
+
+        文风来自 ``civ.voice.for_genre(genre)``，拼进 system prompt 末尾作为口吻约束，
+        保证同系列文本风格连贯。无文风则不加约束。
+        """
+        if civ is not None and genre is not None:
+            voice = civ.voice.for_genre(genre)
+            if voice:
+                system = f"{system}\n本文明此体裁的一贯文风须遵循：{voice}"
         return self.provider.generate(GenRequest(system=system, user=user, context_docs=context_docs, max_tokens=max_tokens))
 
     def chronicle(self, w: World, events: list[Event]) -> Artifact:
@@ -110,10 +134,11 @@ class ArtifactFactory:
         """A resident's diary entry — pick a living notable, else an anonymous citizen.
 
         作者必须是**在本日记落款年份仍存活**的人物。已故者不得写日记——
-        这正是「人物死后还能写日记」bug 的修复点。落款年份取本篇聚焦事件年；
-        若该年作者已死，则排除。无合适名人时退化为匿名居民。
+        这正是「人物死后还能写日记」bug 的修复点。落款年份从本 tick 区间内随机取
+        （:meth:`_year_in_span`），使各篇日记散布在不同年份；若该年作者已死，则排除。
+        无合适名人时退化为匿名居民。注入作者所属文明的日记文风，保证口吻连贯。
         """
-        focal = self._focal_year(w, events)
+        focal = self._year_in_span(w)
         candidates = [
             p for c in w.civs for p in (c.people if person is None else [])
             # 在世判定：未死，或死于落款年份之后（落款那刻人还在）。
@@ -130,6 +155,7 @@ class ArtifactFactory:
                 f"用符合你身份与年龄的口吻写日记。"
             )
             civ_id = who.civ_id
+            civ = w.civ(who.civ_id)
         else:
             author = "无名之民"
             author_id = None
@@ -149,10 +175,11 @@ class ArtifactFactory:
                 f"本时段发生的事：\n{self.events_brief(events)}"
             ),
             context_docs=[self.world_brief(w)],
+            civ=civ, genre="diary",
         )
         return Artifact(
-            genre="diary", title=f"{author}的日记·{self._focal_year(w, events)}年",
-            body=body, year=self._focal_year(w, events), civ_id=civ_id, tick=w.tick_count,
+            genre="diary", title=f"{author}的日记·{focal}年",
+            body=body, year=focal, civ_id=civ_id, tick=w.tick_count,
             author=author, author_id=author_id,
         )
 
@@ -162,6 +189,7 @@ class ArtifactFactory:
         if not any(any(k in e.title for k in gov_words) for e in events):
             return None
         civ = self.rng.choice(w.civs)
+        year = self._year_in_span(w)  # 诏令落款年从区间内随机取，散布开。
         body = self._gen(
             system=(
                 "你是该文明的统治者，颁布一道诏令/法令。语气威严、正式，"
@@ -169,14 +197,15 @@ class ArtifactFactory:
                 "符合该政体的口吻开头。"
             ),
             user=(
-                f"颁布地：{civ.name}（政体={civ.government.value}）。\n"
+                f"颁布地：{civ.name}（政体={civ.government.value}）。落款 {year} 年。\n"
                 f"本时段要事：\n{self.events_brief(events)}"
             ),
             context_docs=[self.civ_card(civ), self.world_brief(w)],
+            civ=civ, genre="decree",
         )
         return Artifact(
-            genre="decree", title=f"{civ.name}诏令·{self._focal_year(w, events)}年",
-            body=body, year=self._focal_year(w, events), civ_id=civ.id, tick=w.tick_count,
+            genre="decree", title=f"{civ.name}诏令·{year}年",
+            body=body, year=year, civ_id=civ.id, tick=w.tick_count,
             author=f"{civ.name}王廷",
         )
 
@@ -185,20 +214,22 @@ class ArtifactFactory:
         if not any(e.magnitude >= 1.5 for e in events):
             return None
         civ = self.rng.choice(w.civs)
+        year = self._year_in_span(w)
         body = self._gen(
             system=(
                 "你是本信仰的经文抄写者，写一段经文/偈语/神谕来诠释本时段之事。"
                 "语带玄机、韵律感，可含神祇之名。60-150字。"
             ),
             user=(
-                f"信仰背景：{civ.religion}（{civ.name}）。\n"
+                f"信仰背景：{civ.religion}（{civ.name}）。落款 {year} 年。\n"
                 f"需诠释之事：\n{self.events_brief(events)}"
             ),
             context_docs=[self.civ_card(civ)],
+            civ=civ, genre="scripture",
         )
         return Artifact(
-            genre="scripture", title=f"{civ.religion}经文·{self._focal_year(w, events)}年",
-            body=body, year=self._focal_year(w, events), civ_id=civ.id, tick=w.tick_count,
+            genre="scripture", title=f"{civ.religion}经文·{year}年",
+            body=body, year=year, civ_id=civ.id, tick=w.tick_count,
             author=f"{civ.religion}祭司团",
         )
 
@@ -207,20 +238,22 @@ class ArtifactFactory:
         if not any(e.source == "player" or len(e.involved_civs) >= 2 or "动荡" in e.title for e in events):
             return None
         civ = self.rng.choice(w.civs)
+        year = self._year_in_span(w)
         body = self._gen(
             system=(
                 "你是会议书记，撰写一份议事会/长老会/议会的会议纪要。"
                 "条目化、严肃、记录议题与议决。150-300字。"
             ),
             user=(
-                f"会议方：{civ.name}（{civ.government.value}）。\n"
+                f"会议方：{civ.name}（{civ.government.value}）。落款 {year} 年。\n"
                 f"议事背景：\n{self.events_brief(events)}"
             ),
             context_docs=[self.civ_card(civ)],
+            civ=civ, genre="minutes",
         )
         return Artifact(
-            genre="minutes", title=f"{civ.name}议事纪要·{self._focal_year(w, events)}年",
-            body=body, year=self._focal_year(w, events), civ_id=civ.id, tick=w.tick_count,
+            genre="minutes", title=f"{civ.name}议事纪要·{year}年",
+            body=body, year=year, civ_id=civ.id, tick=w.tick_count,
             author="议事会书记",
         )
 

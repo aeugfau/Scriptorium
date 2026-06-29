@@ -100,12 +100,13 @@ class Simulation:
             self.rng = random.Random()
         # Import lazily to avoid a hard dependency cycle (generators -> engine).
         from .generators import ArtifactFactory
-        from .naming import NameGenerator, RoleProposer
+        from .naming import NameGenerator, RoleProposer, VoiceReformer
 
         self.factory = ArtifactFactory(self.provider)
-        # 命名生成器与角色提议器：LLM 即兴生成，mock 兜底。与叙事生成共用同一 provider。
+        # 命名生成器、角色提议器、文风审定器：LLM 即兴生成，mock 兜底。与叙事生成共用同一 provider。
         self.name_gen = NameGenerator(self.provider, rng=self.rng)
         self.role_proposer = RoleProposer(self.provider, rng=self.rng)
+        self.voice_reformer = VoiceReformer(self.provider, rng=self.rng)
 
     # ------------------------------------------------------------------ step
 
@@ -247,21 +248,23 @@ class Simulation:
     # -------------------------------------------------------- naming/role 演化
 
     def _on_tech_up(self, c: Civilization) -> None:
-        """科技升级时：调整命名规范（加新意象词根）+ 提议新身份 + 解锁阶层。
+        """科技升级时：调整命名规范（加新意象词根）+ 提议新身份 + 解锁阶层 + 文风微调。
 
-        规则给基础演化（确定性），LLM 提议新身份（涌现）。两步都写 Fact，
-        使「命名/社会结构的变迁」成为可见的文明史。
+        规则给基础演化（确定性），LLM 提议新身份/文风（涌现）。各步都写 Fact，
+        使「命名/社会结构/文风的变迁」成为可见的文明史。
         """
         trigger = f"tech_{c.tech_level.name.lower()}"
         self._maybe_evolve_naming(c, kind="tech", trigger=trigger)
         self._maybe_propose_roles(c, trigger)
+        self._maybe_evolve_voice(c, trigger)
 
     def _on_gov_change(self, c: Civilization) -> None:
-        """政体更替时：调整命名风格说明 + 提议新身份 + 解锁/调整阶层。"""
+        """政体更替时：调整命名风格说明 + 提议新身份 + 解锁/调整阶层 + 文风微调。"""
         trigger = f"gov_{c.government.value}"
         self._maybe_evolve_naming(c, kind="gov", trigger=trigger)
         self._maybe_propose_roles(c, trigger)
         self._unlock_classes_for_government(c)
+        self._maybe_evolve_voice(c, trigger)
 
     def _unlock_classes_for_government(self, c: Civilization) -> None:
         """按政体解锁核心阶层——让「谁能说话」反映社会形态。
@@ -345,6 +348,30 @@ class Simulation:
                 statement=f"{w.year} 年 {c.name} 出现「{title}」这一身份"
                           f"（属{sc.value}阶层）。",
             ))
+
+    def _maybe_evolve_voice(self, c: Civilization, trigger: str) -> None:
+        """调 ``VoiceReformer`` 提议文风微调，更新 ``civ.voice`` 并写 ``Fact``。
+
+        LLM 提议契合新阶段的笔法调整（如共和后编年史去颂圣），引擎采纳后更新
+        ``by_genre``。同系列文本因此风格连贯，文风变迁也成为可见文明史。
+        mock 模式按触发关键词给固定候选。无调整则不写 Fact。
+        """
+        try:
+            changes = self.voice_reformer.propose(c, trigger)
+        except Exception as exc:  # LLM 抖动不拖垮 tick
+            print(f"[civsim] voice_reformer 失败 ({exc})，跳过。")
+            return
+        if not changes:
+            return
+        w = self.world
+        for genre, note in changes.items():
+            c.voice.by_genre[genre] = note
+        summary = "、".join(f"{g}笔法改为「{n}」" for g, n in changes.items())
+        w.facts.append(Fact(
+            id=f"voice-{c.id}-{w.year}-{trigger}", kind="voice_reform", year=w.year,
+            subject=c.id, scope=c.id,
+            statement=f"{w.year} 年 {c.name} 文风变更：{summary}。",
+        ))
 
     # ---------------------------------------------------------------- emerge
 
