@@ -92,9 +92,10 @@ python -m civsim.cli resume saves/world.json
 
 ```
 civsim/
-  models.py     结构化世界状态（Pydantic）—— 文明、人物、事件、纪元、既成事实(Fact)
-  engine.py     混合驱动引擎：规则推进 + 涌现 + 玩家事件 + 叙事；含寿命分级表
+  models.py     结构化世界状态（Pydantic）—— 文明、人物、事件、纪元、既成事实(Fact)、命名规范、社会阶层
+  engine.py     混合驱动引擎：规则推进 + 涌现 + 玩家事件 + 叙事；含寿命分级与命名/阶层演化
   generators.py 多体裁文本生成器 + 事后校验层（_violations/_validated）
+  naming.py     LLM 命名生成器 + 角色身份提议器（NameGenerator/RoleProposer，mock 兜底）
   providers.py  可插拔 LLM 后端（mock / Anthropic / OpenAI兼容 / 本地）+ 配置文件工厂
   archive.py    档案库：Markdown 落盘 + SQLite 索引
   cli.py        rich 终端交互入口
@@ -111,8 +112,11 @@ saves/          世界存档（JSON）
 - **叙事时间真实性**：事件年份散落在 tick 区间内（非整 25/50/75），档案落款用
   聚焦事件的真实年份（见 `generators._focal_year`）。
 - **既成事实台账 + 事后校验**：防止「死后写日记」「败者翻案」等叙事脱节。引擎在
-  人物死亡/战争胜负时写 `Fact`；生成器把 active facts 作为硬约束喂给 LLM，并在档案
-  产出后用 `_violations` 机械校验、违规则重生成。详见 CONTRIBUTING.md 专节。
+  人物死亡/战争胜负/命名变革/身份涌现时写 `Fact`；生成器把 active facts 作为硬约束
+  喂给 LLM，并在档案产出后用 `_violations` 机械校验、违规则重生成。详见 CONTRIBUTING.md 专节。
+- **命名与社会结构涌现**：每文明有结构化 `NamingStyle`（词库+模板+风格说明，可演化）；
+  名字由 LLM 按规范即兴生成；社会身份（核心阶层枚举做骨架 + LLM 提议的具体头衔做血肉）
+  随科技/政体演化涌现、加入 `role_pool` 增长。详见 CONTRIBUTING.md 专节。
 
 ## 给协作者的代码导读
 
@@ -124,9 +128,11 @@ saves/          世界存档（JSON）
    `LIFESPAN_BY_TECH` 是各时代寿命旋钮；`_emerge` 里写 Fact 的位置要看清。
 3. `generators.py` —— 看 `ArtifactFactory`，每体裁一个方法，决定档案怎么生成；
    再看 `_violations`/`_validated`，理解事后校验如何兜底叙事一致性。
-4. `providers.py` —— 看 `get_provider_from_config` 工厂与 `LLMProvider` 协议，换后端只动这里。
-5. `archive.py` —— 看 `Archive.add/list/read`，档案如何落盘与检索。
-6. `cli.py` —— 交互入口，串起以上各模块。
+4. `naming.py` —— 看 `NameGenerator`/`RoleProposer`，理解 LLM 如何按命名规范生成名字、
+   按文明现状涌现新身份；mock 兜底如何保证零配置可跑。
+5. `providers.py` —— 看 `get_provider_from_config` 工厂与 `LLMProvider` 协议，换后端只动这里。
+6. `archive.py` —— 看 `Archive.add/list/read`，档案如何落盘与检索。
+7. `cli.py` —— 交互入口，串起以上各模块。
 
 注释约定：模块级 docstring 讲「这文件做什么、与谁交互」；类/方法 docstring 讲「职责、参数、副作用」；
 行内注释只标「为什么这么做」而非「做了什么」。改代码时请保持同样风格。详细约定见 CONTRIBUTING.md。

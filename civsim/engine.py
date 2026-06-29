@@ -31,6 +31,7 @@ from .models import (
     Government,
     Person,
     Relation,
+    SocialClass,
     TechLevel,
     World,
 )
@@ -99,8 +100,12 @@ class Simulation:
             self.rng = random.Random()
         # Import lazily to avoid a hard dependency cycle (generators -> engine).
         from .generators import ArtifactFactory
+        from .naming import NameGenerator, RoleProposer
 
         self.factory = ArtifactFactory(self.provider)
+        # 命名生成器与角色提议器：LLM 即兴生成，mock 兜底。与叙事生成共用同一 provider。
+        self.name_gen = NameGenerator(self.provider, rng=self.rng)
+        self.role_proposer = RoleProposer(self.provider, rng=self.rng)
 
     # ------------------------------------------------------------------ step
 
@@ -199,9 +204,11 @@ class Simulation:
         c.wealth = max(0.0, c.wealth - research * 0.5)  # 研究消耗一半投入的财富
 
         # 科技升级：满 100 进一级，清零进度；INDUSTRIAL 是上限。
+        leveled_up = False
         if c.tech_progress >= 100 and c.tech_level != TechLevel.INDUSTRIAL:
             c.tech_level = TechLevel(c.tech_level.value + 1)
             c.tech_progress = 0.0
+            leveled_up = True
 
         # --- 稳定度：向「政体均衡点」缓慢漂移（一阶趋近）---
         # 共和制均衡最高(70)、帝国最低(58)——体现「大帝国难维系」的直觉。
@@ -211,7 +218,15 @@ class Simulation:
         c.stability = max(0.0, min(100.0, c.stability))
 
         # 政体演化：在粗阈值上自动跃迁（见 _maybe_evolve_government）。
+        prev_gov = c.government
         self._maybe_evolve_government(c)
+        gov_changed = c.government != prev_gov
+
+        # 命名规范与角色身份的演化：科技升级/政体更替时触发（见对应方法）。
+        if leveled_up:
+            self._on_tech_up(c)
+        if gov_changed:
+            self._on_gov_change(c)
 
     def _maybe_evolve_government(self, c: Civilization) -> None:
         """政体在粗阈值上自动跃迁。阈值是有意的「非常粗糙」——本游戏重叙事轻数值。
@@ -228,6 +243,108 @@ class Simulation:
             c.government = Government.REPUBLIC if c.stability > 55 else Government.THEOCRACY
         elif c.government is Government.REPUBLIC and c.population > 50000:
             c.government = Government.EMPIRE
+
+    # -------------------------------------------------------- naming/role 演化
+
+    def _on_tech_up(self, c: Civilization) -> None:
+        """科技升级时：调整命名规范（加新意象词根）+ 提议新身份 + 解锁阶层。
+
+        规则给基础演化（确定性），LLM 提议新身份（涌现）。两步都写 Fact，
+        使「命名/社会结构的变迁」成为可见的文明史。
+        """
+        trigger = f"tech_{c.tech_level.name.lower()}"
+        self._maybe_evolve_naming(c, kind="tech", trigger=trigger)
+        self._maybe_propose_roles(c, trigger)
+
+    def _on_gov_change(self, c: Civilization) -> None:
+        """政体更替时：调整命名风格说明 + 提议新身份 + 解锁/调整阶层。"""
+        trigger = f"gov_{c.government.value}"
+        self._maybe_evolve_naming(c, kind="gov", trigger=trigger)
+        self._maybe_propose_roles(c, trigger)
+        self._unlock_classes_for_government(c)
+
+    def _unlock_classes_for_government(self, c: Civilization) -> None:
+        """按政体解锁核心阶层——让「谁能说话」反映社会形态。
+
+        如君主制补 NOBILITY/CLERGY；共和制补 COMMONER；神权制补 CLERGY；
+        帝国补 NOBILITY/SOLDIER；部落/酋邦保留简朴。奴隶/边缘阶层 MARGINAL
+        在低级政体或动荡社会才解锁。
+        """
+        gov_classes = {
+            Government.TRIBAL: [SocialClass.COMMONER, SocialClass.SOLDIER],
+            Government.CHIEFDOM: [SocialClass.COMMONER, SocialClass.SOLDIER, SocialClass.NOBILITY],
+            Government.MONARCHY: [SocialClass.NOBILITY, SocialClass.COMMONER, SocialClass.SOLDIER, SocialClass.CLERGY],
+            Government.REPUBLIC: [SocialClass.NOBILITY, SocialClass.COMMONER, SocialClass.ARTISAN, SocialClass.SOLDIER],
+            Government.THEOCRACY: [SocialClass.CLERGY, SocialClass.NOBILITY, SocialClass.COMMONER, SocialClass.MARGINAL],
+            Government.EMPIRE: [SocialClass.NOBILITY, SocialClass.SOLDIER, SocialClass.COMMONER, SocialClass.OUTSIDER],
+        }.get(c.government, [SocialClass.COMMONER])
+        for sc in gov_classes:
+            if sc not in c.social_classes:
+                c.social_classes.append(sc)
+
+    def _maybe_evolve_naming(self, c: Civilization, kind: str, trigger: str) -> None:
+        """按规则调整命名规范，并写 ``Fact(kind="naming_reform")`` 记录。
+
+        演化是有意的「轻触」：只在词库追加少量契合新阶段的意象词根、微调
+        style_note，不重写整套规范——保留文明命名连续性。
+        """
+        ns = c.naming
+        year = self.world.year
+        additions: list[str] = []
+        if kind == "tech":
+            # 每个科技阶段引入对应意象词根（金属/工艺/学术）。
+            tech_roots = {
+                TechLevel.BRONZE: ["铜", "锡", "铸"],
+                TechLevel.IRON: ["铁", "刃", "炉"],
+                TechLevel.MEDIEVAL: ["堡", "纹", "约"],
+                TechLevel.RENAISSANCE: ["翰", "星", "卷"],
+                TechLevel.INDUSTRIAL: ["机", "烟", "轮"],
+            }.get(c.tech_level, [])
+            for r in tech_roots:
+                if r not in ns.roots:
+                    ns.roots.append(r)
+                    additions.append(f"词根「{r}」")
+        elif kind == "gov":
+            gov_notes = {
+                Government.MONARCHY: "王权时代，名字常带氏族与封地",
+                Government.REPUBLIC: "共和公民名，去贵族前缀、尚简朴",
+                Government.THEOCRACY: "神权时代，名字多取圣徒与神迹意象",
+                Government.EMPIRE: "帝国时代，名字尚武功与行省",
+            }.get(c.government, "")
+            if gov_notes:
+                ns.style_note = (ns.style_note + "；" if ns.style_note else "") + gov_notes
+                additions.append(f"风格说明更新为「{gov_notes}」")
+        if additions:
+            w = self.world
+            w.facts.append(Fact(
+                id=f"naming-{c.id}-{year}-{kind}", kind="naming_reform", year=year,
+                subject=c.id, scope=c.id,
+                statement=f"{year} 年 {c.name} 命名规范变更：{'、'.join(additions)}。"
+                          f"此后该文明人物命名依新规范。",
+            ))
+
+    def _maybe_propose_roles(self, c: Civilization, trigger: str) -> None:
+        """调 ``RoleProposer`` 提议新身份，加入 ``role_pool`` 并写 ``Fact``。
+
+        LLM 提议契合文明现状的新头衔（如科技进青铜→「铜匠」），引擎去重后落库。
+        role_pool 的增长本身即文明社会演化的可见记录。mock 模式给固定候选。
+        """
+        try:
+            proposals = self.role_proposer.propose(c, trigger, count=2)
+        except Exception as exc:  # LLM 抖动不拖垮 tick
+            print(f"[civsim] role_proposer 失败 ({exc})，跳过。")
+            return
+        w = self.world
+        for title, sc in proposals:
+            if title in c.role_pool:
+                continue
+            c.role_pool.append(title)
+            w.facts.append(Fact(
+                id=f"role-{c.id}-{w.year}-{title}", kind="role_emergence", year=w.year,
+                subject=c.id, scope=c.id,
+                statement=f"{w.year} 年 {c.name} 出现「{title}」这一身份"
+                          f"（属{sc.value}阶层）。",
+            ))
 
     # ---------------------------------------------------------------- emerge
 
@@ -369,27 +486,28 @@ class Simulation:
         return events
 
     def _spawn_person(self, c: Civilization, year: int) -> Person:
-        """随机生成一位名人。名字库/角色库都很小，刻意保持朴素。
+        """生成一位名人：名字由 ``name_gen`` 按命名规范生成，身份从 ``role_pool`` 抽取。
 
-        出生年回拨 20–40 年，使其出场时已是成年。id 含文明+序号+年份，保证唯一。
-        名字带序号后缀（如「苏萨·诺尔海姆·二」）以避免撞名——名字库小而文明寿命长，
-        不加区分会出现同名人物，导致叙事与校验混淆。
-        扩充名字/角色库直接改下面两个列表即可。
+        立体化：随机选一个核心阶层（从该文明已解锁 ``social_classes``）+ 该阶层下
+        的具体身份头衔（从 ``role_pool`` 抽，空则用「居民」）+ 年龄段（少年/壮年/老），
+        写入 ``social_class``/``role``/``age_note``。出生年回拨 20–40 年。
+        id 含文明+序号+年份，保证唯一；名字由 NameGenerator 去重。
         """
-        roles = ["国王", "将军", "哲人", "商人", "祭司", "史官", "工程师"]
-        names = ["阿兰", "苏萨", "卡恩", "伊岚", "穆克", "薇拉", "诺亚", "萨拉",
-                 "伊萨", "图兰", "薇恩", "赫尔"]
-        ordinals = ["", "·二", "·三", "·四", "·五", "·六", "·七"]
-        role = self.rng.choice(roles)
-        given = self.rng.choice(names)
-        # 该文明已有多少位同名（名前缀相同）者，据此加序号后缀避免完全同名。
-        same = sum(1 for p in c.people if p.name.split("·")[0] == given) if c.people else 0
-        suffix = ordinals[min(same, len(ordinals) - 1)]
-        name = f"{given}·{c.name}{suffix}"
+        # 选阶层与身份：阶层从已解锁池抽；身份从 role_pool 抽（偏好该阶层下的）。
+        sclass = self.rng.choice(c.social_classes) if c.social_classes else SocialClass.COMMONER
+        # role_pool 里的身份不直接带阶层信息，这里简化：随机抽一个；引擎在提议身份时
+        # 已把阶层记在 Fact，此处 role 仅作展示。身份空则用泛称。
+        role = self.rng.choice(c.role_pool) if c.role_pool else "居民"
+        # 年龄段：影响视角质感（少年/壮年/老），写入 age_note 供生成器挑视角。
+        age_note = self.rng.choice(["少年", "壮年", "壮年", "老"])
+        # 名字：LLM 按命名规范生成（mock 兜底随机组合），自动去重。
+        names = self.name_gen.generate(c, count=1)
+        name = names[0] if names else "某人"
         pid = f"{c.id}-p{len(c.people)+1}-{year}"
+        birth = year - self.rng.randint(20, 40)
         return Person(
-            id=pid, name=name, role=role, civ_id=c.id,
-            birth_year=year - self.rng.randint(20, 40),
+            id=pid, name=name, role=role, social_class=sclass, civ_id=c.id,
+            birth_year=birth, age_note=age_note,
             bio=f"{c.name} 的一位 {role}。",
         )
 

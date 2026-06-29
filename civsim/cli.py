@@ -28,7 +28,8 @@ from rich.table import Table
 from .archive import Archive
 from .engine import Simulation
 from .models import (
-    Biome, Civilization, Era, Event, Government, Relation, TechLevel, World,
+    Biome, Civilization, Era, Event, Government, NamingStyle, Relation,
+    SocialClass, TechLevel, World,
 )
 from .providers import get_provider, get_provider_from_config
 
@@ -52,6 +53,7 @@ def build_world(cfg_path: str) -> World:
 
     civs: list[Civilization] = []
     for c in cfg.get("civs", []):
+        naming_cfg = c.get("naming", {})
         civs.append(Civilization(
             id=c["id"], name=c["name"], biome=Biome(c["biome"]),
             population=c.get("population", 1000),
@@ -61,6 +63,18 @@ def build_world(cfg_path: str) -> World:
             religion=c.get("religion", "animism"),
             culture_traits=c.get("culture_traits", []),
             color=c.get("color", "white"),
+            # 命名规范与社会结构（均有默认值，缺省也能跑）。
+            naming=NamingStyle(
+                roots=naming_cfg.get("roots", []),
+                prefixes=naming_cfg.get("prefixes", []),
+                suffixes=naming_cfg.get("suffixes", []),
+                clans=naming_cfg.get("clans", []),
+                template=naming_cfg.get("template", "{root}"),
+                style_note=naming_cfg.get("style_note", ""),
+                gendered=naming_cfg.get("gendered", False),
+            ),
+            social_classes=[SocialClass(s) for s in c.get("social_classes", ["commoner"])],
+            role_pool=c.get("role_pool", []),
         ))
     # 应用外交关系矩阵：双向写入。
     for a, b, rel in cfg.get("relations", []):

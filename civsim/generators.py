@@ -33,12 +33,16 @@ class ArtifactFactory:
     def civ_card(self, c: Civilization) -> str:
         """Compact text snapshot of a civ — the generator's "memory" of it."""
         rels = ", ".join(f"{k}:{v.value}" for k, v in c.relations.items()) or "无"
-        people = "; ".join(f"{p.name}({p.role})" for p in c.people if p.death_year is None) or "无名人"
+        people = "; ".join(
+            f"{p.name}({p.role}/{p.social_class.value})"
+            for p in c.people if p.death_year is None
+        ) or "无名人"
         return (
             f"{c.name} [biome={c.biome.value}] 人口{c.population} "
             f"粮储{c.food:.0f} 财富{c.wealth:.0f} 科技={c.tech_level.name}({c.tech_progress:.0f}) "
             f"政体={c.government.value} 信仰={c.religion} 稳定{c.stability:.0f} "
-            f"外交:{rels} 名人:{people}"
+            f"外交:{rels} 命名风格:{c.naming.style_note or '朴素'} "
+            f"社会阶层:{[s.value for s in c.social_classes]} 名人:{people}"
         )
 
     def world_brief(self, w: World) -> str:
@@ -119,8 +123,12 @@ class ArtifactFactory:
             who = self.rng.choice(candidates)
             author = who.name
             author_id = who.id  # 记 id 而非仅名字：校验按 id 匹配，避免重名误判。
-            # 若作者在落款年份之后才死，提示 LLM 此人此时尚在、但命数将尽（可选氛围）。
-            perspective = f"你是 {who.name}，{who.role}。此时为 {focal} 年。"
+            # 注入阶层/年龄/具体身份背景，让视角有层次（贵族与边缘流民语气迥异）。
+            perspective = (
+                f"你是 {who.name}，{who.age_note or '壮年'}{who.role}"
+                f"（{who.social_class.value}阶层）。此时为 {focal} 年。"
+                f"用符合你身份与年龄的口吻写日记。"
+            )
             civ_id = who.civ_id
         else:
             author = "无名之民"
@@ -133,6 +141,7 @@ class ArtifactFactory:
             system=(
                 "你是一位游戏中的虚构人物，写一篇私人日记。第一人称、口语化、"
                 "带情绪与生活细节，记录本时段影响你的事。120-250字。"
+                "口吻须符合你的阶层与年龄身份（贵族矜持、工匠务实、边缘人困顿等）。"
                 "严格遵守既成事实：已辞世之人不得作为日记作者出现，也不得在文中说话行动。"
             ),
             user=(

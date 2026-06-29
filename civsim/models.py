@@ -83,24 +83,68 @@ class Relation(str, Enum):
     WAR = "war"            # 交战
 
 
+class SocialClass(str, Enum):
+    """核心社会阶层（枚举，确定性逻辑用）——视角人物的「骨架」。
+
+    为什么用枚举而非自由文本：诏令「谁能发」、议事会「谁能出席」这类判断
+    需要确定性逻辑（如「君主制→NOBILITY 发诏令」），枚举保证可判定。
+    具体的身份头衔（如「航海长」「角斗士」「异端审判官」）是「血肉」，
+    由 LLM 提议、加入文明 ``role_pool``，spawn 时从中抽取——每个身份归入
+    某个核心阶层，故既丰富又不破坏确定性逻辑。
+    """
+
+    NOBILITY = "nobility"    # 贵族/统治者
+    COMMONER = "commoner"    # 平民（农/渔/牧）
+    ARTISAN = "artisan"      # 工匠/匠人
+    SOLDIER = "soldier"      # 军人
+    CLERGY = "clergy"        # 祭司/神职
+    OUTSIDER = "outsider"    # 外乡人/客商
+    MARGINAL = "marginal"    # 边缘：奴隶/流民/异教徒/寡妇等
+
+
 # ---------------------------------------------------------------------------
 # 核心模型
 # ---------------------------------------------------------------------------
 
 
+class NamingStyle(BaseModel):
+    """一个文明的命名规范 —— 结构化词库+模板，可控、可演化、可入 config。
+
+    名字本身由 LLM 按本规范即兴组合（见 ``naming.NameGenerator``），但「组合的
+    规矩」是结构化的：换文明有不同词库与模板，且随文明演化（科技升级/政体更替）
+    而调整，调整时写 ``Fact(kind="naming_reform")`` 记录，使命名风格变迁本身成为文明史。
+
+    ``template`` 支持占位符：{prefix}/{root}/{suffix}/{clan}/{ordinal}，
+    未用到的占位符在组合时省略。``style_note`` 是给 LLM 的风格说明（如「海民喜
+    航海意象、父子连名」），让生成的名字贴合文明气质。
+    """
+
+    roots: list[str] = Field(default_factory=list)        # 词根库（名字核心音节/意象）
+    prefixes: list[str] = Field(default_factory=list)     # 前缀库
+    suffixes: list[str] = Field(default_factory=list)     # 后缀库
+    clans: list[str] = Field(default_factory=list)        # 氏族名库
+    template: str = "{root}"                              # 组合模板
+    style_note: str = ""                                  # 文字风格说明，给 LLM 参考
+    gendered: bool = False                                # 是否区分性别用名
+
+
 class Person(BaseModel):
     """重要人物。每个文明只维护少数几位，用于给叙事提供「角色」。
 
-    注意 ``bio`` 留空/简短是有意的：人物的丰满生平交给生成器在档案里即兴展开，
+    ``role`` 承载具体的身份头衔（如「航海长」「角斗士」），由 LLM 提议、
+    从文明 ``role_pool`` 抽取；``social_class`` 是该身份所属的核心阶层（枚举），
+    供确定性逻辑判断。``bio`` 留空/简短是有意的：丰满生平交给生成器即兴展开，
     不持久化进状态——避免长篇大论污染结构化数据、也避免跨 tick 不一致。
     """
 
     id: str                       # 唯一标识，形如 ``norheim-p1-25``
     name: str                     # 显示名
-    role: str                     # 身份，如 "国王"/"将军"/"哲人"
+    role: str                     # 具体身份头衔，如 "航海长"/"角斗士"
+    social_class: SocialClass = SocialClass.COMMONER  # 所属核心阶层（确定性逻辑用）
     civ_id: str                   # 所属文明 id
     birth_year: int               # 出生年
     death_year: Optional[int] = None  # 卒年；``None`` 表示仍在世
+    age_note: str = ""            # 年龄段提示，如 "老"/"少年"——给生成器挑视角用，非权威状态
     bio: str = ""                 # 简短备注，生成器可扩展（不作为权威状态）
 
 
@@ -125,6 +169,10 @@ class Civilization(BaseModel):
     government: Government = Government.TRIBAL    # engine._maybe_evolve_government 演化
     religion: str = "animism"                     # 自由文本，由 config 设定，叙事用
     culture_traits: list[str] = Field(default_factory=list)  # 文化特质标签，叙事用
+    # --- 命名与社会结构 ---
+    naming: NamingStyle = Field(default_factory=NamingStyle)  # 命名规范，可演化（见 naming.NameGenerator）
+    social_classes: list[SocialClass] = Field(default_factory=lambda: [SocialClass.COMMONER])  # 已解锁核心阶层
+    role_pool: list[str] = Field(default_factory=list)  # 已涌现的具体身份头衔（LLM 提议扩充），spawn 时抽取
     # --- 外交：对方 civ_id -> 本文明对其的立场 ---
     relations: dict[str, Relation] = Field(default_factory=dict)  # engine._diplomacy_tick 维护
     # --- 人物 ---
@@ -174,6 +222,8 @@ class Fact(BaseModel):
     - 人物死亡：某人于某年辞世 → 之后任何档案不得让此人说话/行动/写日记。
     - 战争胜负：A 于某年战胜 B → 不得再写 B 此役取胜。
     - 政体更替：某文明某年改共和 → 不得再写其为君主。
+    - 命名变革（naming_reform）：某文明某年改用……命名。
+    - 身份涌现（role_emergence）：某文明某年出现『角斗士』这一身份。
 
     ``scope`` 给出生效范围；``holds_until`` 留给"暂时性事实"（如停战），
     永久事实为 None。
