@@ -163,18 +163,47 @@ class Era(BaseModel):
     description: str = ""
 
 
+class Fact(BaseModel):
+    """既成事实台账 —— 不可逆的权威记录，约束叙事不得违背。
+
+    事件（Event）是「发生了什么」的流水；事实（Fact）是「由此确立的、
+    以后永远成立的状态」。区别在于：事件会被时间线截断、会被遗忘；
+    而事实一旦写入，生成器在产出档案时必须遵守，且违反即视为叙事错误。
+
+    典型用途：
+    - 人物死亡：某人于某年辞世 → 之后任何档案不得让此人说话/行动/写日记。
+    - 战争胜负：A 于某年战胜 B → 不得再写 B 此役取胜。
+    - 政体更替：某文明某年改共和 → 不得再写其为君主。
+
+    ``scope`` 给出生效范围；``holds_until`` 留给"暂时性事实"（如停战），
+    永久事实为 None。
+    """
+
+    id: str
+    kind: str            # "death" | "victory" | "regime_change" | "treaty" | ...
+    year: int            # 事实成立的年份
+    subject: str         # 主语，如人物 id 或文明 id
+    statement: str       # 人类可读的陈述句，直接喂给 LLM 作为硬约束
+    scope: str = "world"  # 生效范围："world" | civ_id | person_id
+    holds_until: Optional[int] = None  # None=永久；否则到该年失效
+
+
 class World(BaseModel):
     """完整世界状态。整个模拟的可序列化根。
 
     一次 ``tick()`` 的流程：推进 ``year``/``tick_count`` → 规则更新各 civ →
-    产生新事件并入 ``events`` → 生成档案 → 把事件一行摘要压入 ``chronicle``。
-    ``chronicle`` 是滚动记忆，只保留最近若干条，喂给生成器作为上下文。
+    产生新事件并入 ``events``（同时在不可逆节点写 ``facts``）→ 生成档案并经校验 →
+    把事件一行摘要压入 ``chronicle``。
+    ``chronicle`` 是滚动记忆，只保留最近若干条，喂给生成器作为上下文；
+    ``facts`` 是既成事实台账，永久约束叙事（见 :class:`Fact`）。
+
+    随机性：``seed == 0`` 时每次开局真随机；填正整数则该局可复现（见 engine 播种逻辑）。
     """
 
     name: str
     year: int = 0                 # 当前世界年
     tick_count: int = 0           # 已推进的 tick 数
-    seed: int = 0                 # 随机种子；决定涌现的随机性，可复现
+    seed: int = 0                 # 0=每次随机；正整数=可复现
     years_per_tick: int = 25      # 一个 tick 推进多少年；粗粒度让档案可读
     continents: list[str] = Field(default_factory=list)  # 仅展示用的大陆名
     civs: list[Civilization] = Field(default_factory=list)
@@ -182,6 +211,8 @@ class World(BaseModel):
     eras: list[Era] = Field(default_factory=list)
     chronicle: list[str] = Field(default_factory=list)      # 滚动摘要，最近 40 条
     pending_events: list[Event] = Field(default_factory=list)  # 玩家已排队、下个 tick 消费
+    # 既成事实台账：不可逆权威记录，约束叙事。见 Fact 文档。
+    facts: list[Fact] = Field(default_factory=list)
 
     def civ(self, civ_id: str) -> Civilization:
         """按 id 取文明；找不到则抛 ``KeyError``（属编程错误，应早暴露）。"""
@@ -197,4 +228,22 @@ class World(BaseModel):
             for p in c.people:
                 if p.death_year is None or p.death_year > self.year:
                     out.append(p)
+        return out
+
+    def active_facts(self, year: int | None = None, scope: str | None = None) -> list[Fact]:
+        """返回在 ``year`` 年仍生效的事实（可按 scope 过滤）。
+
+        生成器调用此方法把相关事实注入 prompt，作为叙事硬约束。
+        "生效"判定：year >= fact.year 且（holds_until 为 None 或 year < holds_until）。
+        """
+        y = self.year if year is None else year
+        out = []
+        for f in self.facts:
+            if y < f.year:
+                continue
+            if f.holds_until is not None and y >= f.holds_until:
+                continue
+            if scope is not None and f.scope not in ("world", scope):
+                continue
+            out.append(f)
         return out

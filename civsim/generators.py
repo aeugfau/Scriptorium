@@ -45,10 +45,14 @@ class ArtifactFactory:
         """One-paragraph world context fed to every generator."""
         civ_cards = "\n".join("  - " + self.civ_card(c) for c in w.civs)
         chronicle = "\n".join("  - " + line for line in w.chronicle[-8:]) or "  - (新初创世)"
+        # 既成事实：把当前仍生效的硬约束列出，生成器必须遵守。
+        facts = w.active_facts()
+        facts_block = "\n".join(f"  - {f.statement}" for f in facts) or "  - (无)"
         return (
             f"世界 {w.name}，当前 {w.year} 年（第{w.tick_count}纪元之轮）。\n"
             f"诸文明状态：\n{civ_cards}\n"
-            f"近年要事：\n{chronicle}"
+            f"近年要事：\n{chronicle}\n"
+            f"既成事实（必须遵守，违反即叙事错误）：\n{facts_block}"
         )
 
     def events_brief(self, events: list[Event]) -> str:
@@ -59,6 +63,18 @@ class ArtifactFactory:
             for e in events
         )
 
+    def _focal_year(self, w: World, events: list[Event]) -> int:
+        """取该篇档案的"代表年份"——用于标题与日期落款。
+
+        优先取本篇涉及事件中 magnitude 最大的年份；无事件则取区间中点
+        （prev_year + w.year）/ 2。这样日记/诏令标题的年份落在真实历史内，
+        而非永远卡在 tick 末年份（25/50/75）。
+        """
+        if events:
+            return max(events, key=lambda e: e.magnitude).year
+        # 区间中点：本 tick 覆盖 [w.year-years_per_tick, w.year]。
+        return (w.year - w.years_per_tick + w.year) // 2
+
     # -- per-genre generators ---------------------------------------------
 
     def _gen(self, system: str, user: str, context_docs: list[str], max_tokens: int = 900) -> str:
@@ -66,6 +82,8 @@ class ArtifactFactory:
 
     def chronicle(self, w: World, events: list[Event]) -> Artifact:
         """A history-book chapter covering this tick."""
+        y_from = w.year - w.years_per_tick
+        y_to = w.year
         body = self._gen(
             system=(
                 "你是一位文明史官，负责撰写编年史。用凝练、庄重的半文言体中文，"
@@ -73,35 +91,49 @@ class ArtifactFactory:
                 "可在文案口吻中体现时代氛围。约150-300字。"
             ),
             user=(
-                f"请撰写 {w.year} 年前后这一时段的编年史章节。"
+                f"请撰写 {y_from} 至 {y_to} 年这一时段的编年史章节。"
+                f"凡下文事件已标明年份的，照其年份书写，勿统一改写为整十年/整百年。"
                 f"\n\n本时段要事：\n{self.events_brief(events)}"
             ),
             context_docs=[self.world_brief(w)],
         )
         return Artifact(
             genre="chronicle", title=f"{w.name}编年史·第{w.tick_count}章",
-            body=body, year=w.year, tick=w.tick_count, author="太史馆",
+            body=body, year=self._focal_year(w, events), tick=w.tick_count, author="太史馆",
         )
 
     def diary(self, w: World, events: list[Event], person=None) -> Optional[Artifact]:
-        """A resident's diary entry — pick a living notable, else an anonymous citizen."""
-        candidates = [p for c in w.civs for p in (c.people if person is None else [])
-                     if p.death_year is None]
+        """A resident's diary entry — pick a living notable, else an anonymous citizen.
+
+        作者必须是**在本日记落款年份仍存活**的人物。已故者不得写日记——
+        这正是「人物死后还能写日记」bug 的修复点。落款年份取本篇聚焦事件年；
+        若该年作者已死，则排除。无合适名人时退化为匿名居民。
+        """
+        focal = self._focal_year(w, events)
+        candidates = [
+            p for c in w.civs for p in (c.people if person is None else [])
+            # 在世判定：未死，或死于落款年份之后（落款那刻人还在）。
+            if p.death_year is None or p.death_year > focal
+        ]
         if candidates:
             who = self.rng.choice(candidates)
             author = who.name
-            perspective = f"你是 {who.name}，{who.role}。"
+            author_id = who.id  # 记 id 而非仅名字：校验按 id 匹配，避免重名误判。
+            # 若作者在落款年份之后才死，提示 LLM 此人此时尚在、但命数将尽（可选氛围）。
+            perspective = f"你是 {who.name}，{who.role}。此时为 {focal} 年。"
             civ_id = who.civ_id
         else:
             author = "无名之民"
+            author_id = None
             civ = self.rng.choice(w.civs)
-            perspective = f"你是 {civ.name} 的一名普通居民。"
+            perspective = f"你是 {civ.name} 的一名普通居民。此时为 {focal} 年。"
             civ_id = civ.id
 
         body = self._gen(
             system=(
                 "你是一位游戏中的虚构人物，写一篇私人日记。第一人称、口语化、"
                 "带情绪与生活细节，记录本时段影响你的事。120-250字。"
+                "严格遵守既成事实：已辞世之人不得作为日记作者出现，也不得在文中说话行动。"
             ),
             user=(
                 f"{perspective}\n"
@@ -110,8 +142,9 @@ class ArtifactFactory:
             context_docs=[self.world_brief(w)],
         )
         return Artifact(
-            genre="diary", title=f"{author}的日记·{w.year}年",
-            body=body, year=w.year, civ_id=civ_id, tick=w.tick_count, author=author,
+            genre="diary", title=f"{author}的日记·{self._focal_year(w, events)}年",
+            body=body, year=self._focal_year(w, events), civ_id=civ_id, tick=w.tick_count,
+            author=author, author_id=author_id,
         )
 
     def decree(self, w: World, events: list[Event]) -> Optional[Artifact]:
@@ -133,8 +166,8 @@ class ArtifactFactory:
             context_docs=[self.civ_card(civ), self.world_brief(w)],
         )
         return Artifact(
-            genre="decree", title=f"{civ.name}诏令·{w.year}年",
-            body=body, year=w.year, civ_id=civ.id, tick=w.tick_count,
+            genre="decree", title=f"{civ.name}诏令·{self._focal_year(w, events)}年",
+            body=body, year=self._focal_year(w, events), civ_id=civ.id, tick=w.tick_count,
             author=f"{civ.name}王廷",
         )
 
@@ -155,8 +188,8 @@ class ArtifactFactory:
             context_docs=[self.civ_card(civ)],
         )
         return Artifact(
-            genre="scripture", title=f"{civ.religion}经文·{w.year}年",
-            body=body, year=w.year, civ_id=civ.id, tick=w.tick_count,
+            genre="scripture", title=f"{civ.religion}经文·{self._focal_year(w, events)}年",
+            body=body, year=self._focal_year(w, events), civ_id=civ.id, tick=w.tick_count,
             author=f"{civ.religion}祭司团",
         )
 
@@ -177,10 +210,77 @@ class ArtifactFactory:
             context_docs=[self.civ_card(civ)],
         )
         return Artifact(
-            genre="minutes", title=f"{civ.name}议事纪要·{w.year}年",
-            body=body, year=w.year, civ_id=civ.id, tick=w.tick_count,
+            genre="minutes", title=f"{civ.name}议事纪要·{self._focal_year(w, events)}年",
+            body=body, year=self._focal_year(w, events), civ_id=civ.id, tick=w.tick_count,
             author="议事会书记",
         )
+
+    # -- 校验 -----------------------------------------------------------
+
+    def _violations(self, art: Artifact, w: World) -> list[str]:
+        """扫描已生成的正文，返回与既成事实冲突的描述列表（空=通过）。
+
+        这是「事后校验」层：台账 facts 已在 prompt 里作为硬约束，但 LLM 不 100%
+        可靠，仍可能违规。此处用规则再扫一遍正文，抓住可机械判定的违规：
+
+        - death：日记体裁（第一人称）中不得出现已死作者作为在世说话者。
+          判定：若 art.author 是已死之人（且死于落款年之前），而正文又以第一人称
+          写作且未明确记述其生前往事，即视为违规。简化判定：日记作者是死者即违规
+          （作者筛选本应排除，这是双保险）。
+        - victory：不得写「败者取胜/击败胜者」这类翻案措辞。
+
+        无法机械判定的（如某人语气像在世）留给人工；此处只抓确定的。
+        """
+        violations: list[str] = []
+        facts = w.active_facts(year=art.year)
+
+        # death 校验：日记的 author 不应是「落款年已死」之人。
+        # 与 diary 作者筛选同口径：death_year > focal 时人在世、可写；
+        # 仅当落款年 >= 死亡年（写日记时人已死）才判违规。
+        # 按 author_id（Person.id）匹配 fact.subject，而非按名字——名字会撞名，
+        # 用 id 才能精确锁定具体那个人，避免「同名活人替死人背锅」的误判。
+        if art.genre == "diary" and art.author_id:
+            for f in facts:
+                if f.kind != "death" or f.subject != art.author_id:
+                    continue
+                if art.year >= f.year:
+                    violations.append(
+                        f"日记作者 {art.author}（id={art.author_id}）已于 {f.year} 年辞世，"
+                        f"不得在 {art.year} 年（落款）再写日记（fact: {f.id}）。"
+                    )
+
+        # victory 校验：不得出现败者击败胜者的翻案措辞。
+        for f in facts:
+            if f.kind != "victory":
+                continue
+            # statement 形如「204 年 A 击败 B，...」。
+            parts = f.statement.split("击败")
+            if len(parts) != 2:
+                continue
+            winner = parts[0].split("年")[-1].strip()
+            loser = parts[1].split("，")[0].strip()
+            if winner and loser:
+                if f"{loser}击败{winner}" in art.body or f"{loser}战胜{winner}" in art.body:
+                    violations.append(f"正文出现「{loser}击败{winner}」与胜败事实冲突（fact: {f.id}）。")
+        return violations
+
+    def _validated(self, make_art, w: World, events: list[Event], retries: int = 2) -> Optional[Artifact]:
+        """调用生成器并校验，违规则重生成，最多 ``retries`` 次。
+
+        ``make_art`` 是无参闭包，返回新 Artifact（每次重生成调一次，LLM 因温度有差异）。
+        仍违规则返回最后一次结果并打印告警——宁可带瑕疵产出也不要丢档案。
+        """
+        art = make_art()
+        for attempt in range(retries):
+            vs = self._violations(art, w) if art is not None else []
+            if not vs:
+                return art
+            print(f"[civsim] 校验发现 {len(vs)} 处违规，重生成(第{attempt+1}次): {vs}")
+            art = make_art()
+        # 仍违规：记录后放行（避免死循环/丢档案）。
+        if art is not None:
+            print(f"[civsim] 经 {retries} 次重生成仍有违规，放行: {self._violations(art, w)}")
+        return art
 
     # -- dispatch ----------------------------------------------------------
 
@@ -191,13 +291,13 @@ class ArtifactFactory:
         史官的庄重、居民的私语、王廷的政令、祭司的神谕、议会的条目，互为补充。
 
         容错：单个生成器抛异常不影响整 tick，降级为跳过该体裁（避免一次 LLM
-        抖动毁掉整轮推进）。新增体裁：在此加一个方法 + 接入本函数的遍历列表，
-        并在 archive.Genres 登记。
+        抖动毁掉整轮推进）。每个档案产出后经 ``_validated`` 事后校验，违规则重生成。
+        新增体裁：在此加一个方法 + 接入本函数的遍历列表，并在 archive.Genres 登记。
         """
-        arts: list[Artifact] = [self.chronicle(w, events)]
-        for fn in (self.diary, self.decree, self.scripture, self.minutes):
+        arts: list[Artifact] = []
+        for fn in (self.chronicle, self.diary, self.decree, self.scripture, self.minutes):
             try:
-                a = fn(w, events)
+                a = self._validated(lambda f=fn: f(w, events), w, events)
             except Exception as exc:  # 单体裁失败不拖垮整 tick
                 a = None
                 print(f"[civsim] generator {fn.__name__} failed: {exc}")

@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from .models import (
     Civilization,
     Event,
+    Fact,
     Government,
     Person,
     Relation,
@@ -46,6 +47,20 @@ BIOME_YIELD = {
     "desert": 0.70,
     "mountain": 0.85,
     "tundra": 0.60,
+}
+
+# 按社会发展水平（TechLevel）的寿命区间：(衰老起始年龄, 硬上界年龄)。
+# 设计意图：石器/青铜时代均寿短，越往后医疗与社会组织进步、寿命上界抬升。
+# 到「衰老起始」后逐年递增死亡概率，到「硬上界」则必死——避免出现奴隶制社会
+# 活到 179 这类不合理情况。这是可调设计旋钮：改数字即调整各时代寿命图景。
+# 注：当前不预留"个别个体打破年龄上界"的特殊设定（如长生者），后续如需再加。
+LIFESPAN_BY_TECH = {
+    TechLevel.STONE: (45, 60),        # 石器：衰老45起，最迟60
+    TechLevel.BRONZE: (50, 65),       # 青铜
+    TechLevel.IRON: (55, 70),         # 铁器
+    TechLevel.MEDIEVAL: (60, 78),     # 中古
+    TechLevel.RENAISSANCE: (65, 82),  # 文艺复兴
+    TechLevel.INDUSTRIAL: (70, 88),   # 工业化
 }
 
 
@@ -70,7 +85,18 @@ class Simulation:
         self.world = world
         self.provider = provider or get_provider()
         self.archive = archive
-        self.rng = rng or random.Random(world.seed)
+        # 随机性播种规则（兼顾"每次开局不同"与"可复现一局"）：
+        #   - 显式传入 rng：直接用，调用方完全控制（测试用）。
+        #   - world.seed > 0：用该种子播种，可复现（config.yaml 指定 seed 时生效）。
+        #   - world.seed == 0（默认/未指定）：用真随机播种，每次开局都不同。
+        # 之所以把 0 当作"未指定"：Pydantic 模型 int 字段默认 0，无法用 None 区分，
+        # 故约定 0 = 不固定。想要确定性，在 config 里写一个非零 seed。
+        if rng is not None:
+            self.rng = rng
+        elif world.seed:
+            self.rng = random.Random(world.seed)
+        else:
+            self.rng = random.Random()
         # Import lazily to avoid a hard dependency cycle (generators -> engine).
         from .generators import ArtifactFactory
 
@@ -217,12 +243,19 @@ class Simulation:
         Returns:
             本 tick 涌现出的事件列表。
         """
+        # 真实年份分配：本 tick 覆盖 [prev_year, w.year] 这段历史区间。
+        # 涌现事件不是发生在区间末尾的"整 tick 年"，而是散落在区间内某年——
+        # 这让生成器写出的日记/诏令日期是具体年份（如 17 年、63 年），而非
+        # 永远卡在 25/50/75。区间内随机、可复现（用 self.rng）。
+        def real_year() -> int:
+            return self.rng.randint(prev_year, w.year)
+
         events: list[Event] = []
         for c in w.civs:
             # 饥荒：粮储 <1（与 _rules_step 的饥荒判定一致）。
             if c.food < 1:
                 events.append(Event(
-                    year=w.year, title=f"{c.name} 遭遇饥荒",
+                    year=real_year(), title=f"{c.name} 遭遇饥荒",
                     description=f"粮储耗尽，{c.population} 居民面临断粮，多地出现流民。",
                     involved_civs=[c.id], magnitude=2.0, source="emergent",
                 ))
@@ -230,14 +263,14 @@ class Simulation:
             if c.tech_progress == 0.0 and c.tech_level.value > 0:
                 level_name = c.tech_level.name.title()
                 events.append(Event(
-                    year=w.year, title=f"{c.name} 步入{level_name}时代",
+                    year=real_year(), title=f"{c.name} 步入{level_name}时代",
                     description=f"{c.name} 的工匠与学者取得突破，技术进入 {level_name} 阶段。",
                     involved_civs=[c.id], magnitude=1.5, source="emergent",
                 ))
             # 动荡：稳定度跌破 25。
             if c.stability < 25:
                 events.append(Event(
-                    year=w.year, title=f"{c.name} 爆发动荡",
+                    year=real_year(), title=f"{c.name} 爆发动荡",
                     description=f"民心不稳，{c.name} 境内出现抗议与地方叛乱。",
                     involved_civs=[c.id], magnitude=2.0, source="emergent",
                 ))
@@ -246,28 +279,58 @@ class Simulation:
                 p = self._spawn_person(c, w.year)
                 c.people.append(p)
                 events.append(Event(
-                    year=w.year, title=f"{p.name} 崭露头角",
+                    year=real_year(), title=f"{p.name} 崭露头角",
                     description=f"{p.name} 以 {p.role} 之姿出现在 {c.name} 的历史中。",
                     involved_civs=[c.id], magnitude=1.0, source="emergent",
                 ))
-            # 名人辞世：年过 60 且 30% 概率。
+            # 名人辞世：按所属文明的社会发展水平（TechLevel）决定寿命。
+            age_start, age_cap = LIFESPAN_BY_TECH.get(c.tech_level, (55, 70))
             for p in list(c.people):
-                if p.death_year is None and w.year - p.birth_year > 60 and self.rng.random() < 0.3:
-                    p.death_year = w.year
+                if p.death_year is not None:
+                    continue
+                age = w.year - p.birth_year
+                # 到硬上界必死；进衰老窗口后按年龄递增概率死亡。
+                must_die = age >= age_cap
+                in_decline = age >= age_start
+                # 衰老窗口内：年龄越接近上界，死亡概率越高（线性插值到 ~0.5/tick）。
+                chance = 0.0
+                if in_decline:
+                    span = max(1, age_cap - age_start)
+                    chance = 0.08 + 0.42 * (age - age_start) / span
+                if must_die or (in_decline and self.rng.random() < chance):
+                    # 死亡年份：
+                    # - 必死（到上界）：取「恰好活到上界」那年 = birth + age_cap，
+                    #   而非区间随机年——否则 dyear 可能超过上界，造成「活过头」记录。
+                    # - 概率死亡：取本 tick 区间内随机年（人在区间内某刻老死）。
+                    dyear = (p.birth_year + age_cap) if must_die else real_year()
+                    # 区间边界保护：dyear 不应早于本 tick 起点，也不晚于当前年。
+                    dyear = max(prev_year, min(dyear, w.year))
+                    p.death_year = dyear
                     events.append(Event(
-                        year=w.year, title=f"{p.name} 辞世",
-                        description=f"{c.name} 的 {p.role} {p.name} 于 {w.year} 年离世。",
+                        year=dyear, title=f"{p.name} 辞世",
+                        description=f"{c.name} 的 {p.role} {p.name} 于 {dyear} 年离世，享年 {dyear - p.birth_year}。",
                         involved_civs=[c.id], magnitude=0.8, source="emergent",
+                    ))
+                    # 写入既成事实：此人死亡是永久约束，其后任何档案不得让此人说话/行动。
+                    w.facts.append(Fact(
+                        id=f"death-{p.id}-{dyear}", kind="death", year=dyear,
+                        subject=p.id, scope=p.id,
+                        statement=f"{p.name}（{p.role}）已于 {dyear} 年辞世，"
+                                  f"此后不得再以该人物视角写日记、发言或行动。",
                     ))
 
         # 文明间外交：≥2 文明时，25% 概率触发一次互动。
         if len(w.civs) >= 2 and self.rng.random() < 0.25:
-            events.extend(self._diplomacy_tick(w))
+            events.extend(self._diplomacy_tick(w, prev_year))
         return events
 
-    def _diplomacy_tick(self, w: World) -> list[Event]:
-        """随机抽两个文明，按当前关系推进一次外交互动（交战/贸易）。"""
+    def _diplomacy_tick(self, w: World, prev_year: int) -> list[Event]:
+        """随机抽两个文明，按当前关系推进一次外交互动（交战/贸易）。
+
+        ``prev_year`` 给出本 tick 区间左端，事件年份散落在 [prev_year, w.year] 内。
+        """
         a, b = self.rng.sample(w.civs, 2)
+        y = self.rng.randint(prev_year, w.year)  # 区间内真实年份
         stance = a.relations.get(b.id, Relation.NEUTRAL)
         events: list[Event] = []
         if stance is Relation.WAR and self.rng.random() < 0.5:
@@ -277,9 +340,16 @@ class Simulation:
             loser.stability -= 10
             loser.population = int(loser.population * 0.92)
             events.append(Event(
-                year=w.year, title=f"{winner.name} 与 {loser.name} 交战",
+                year=y, title=f"{winner.name} 与 {loser.name} 交战",
                 description=f"两军交锋，{winner.name} 取胜，{loser.name} 损失惨重。",
                 involved_civs=[a.id, b.id], magnitude=2.0, source="emergent",
+            ))
+            # 写入既成事实：此役胜负不可逆，叙事不得翻案。
+            w.facts.append(Fact(
+                id=f"victory-{winner.id}-{loser.id}-{y}", kind="victory", year=y,
+                subject=winner.id, scope="world",
+                statement=f"{y} 年 {winner.name} 击败 {loser.name}，"
+                          f"{loser.name} 损失惨重。此后叙事不得改写此役胜负。",
             ))
             # 40% 概率战后转为敌对（停火但记仇）。
             if self.rng.random() < 0.4:
@@ -292,7 +362,7 @@ class Simulation:
             a.wealth += 8
             b.wealth += 8
             events.append(Event(
-                year=w.year, title=f"{a.name} 与 {b.name} 缔结贸易",
+                year=y, title=f"{a.name} 与 {b.name} 缔结贸易",
                 description=f"商队往返于两地，{a.name} 与 {b.name} 建立贸易关系。",
                 involved_civs=[a.id, b.id], magnitude=1.0, source="emergent",
             ))
@@ -302,12 +372,20 @@ class Simulation:
         """随机生成一位名人。名字库/角色库都很小，刻意保持朴素。
 
         出生年回拨 20–40 年，使其出场时已是成年。id 含文明+序号+年份，保证唯一。
+        名字带序号后缀（如「苏萨·诺尔海姆·二」）以避免撞名——名字库小而文明寿命长，
+        不加区分会出现同名人物，导致叙事与校验混淆。
         扩充名字/角色库直接改下面两个列表即可。
         """
         roles = ["国王", "将军", "哲人", "商人", "祭司", "史官", "工程师"]
-        names = ["阿兰", "苏萨", "卡恩", "伊岚", "穆克", "薇拉", "诺亚", "萨拉"]
+        names = ["阿兰", "苏萨", "卡恩", "伊岚", "穆克", "薇拉", "诺亚", "萨拉",
+                 "伊萨", "图兰", "薇恩", "赫尔"]
+        ordinals = ["", "·二", "·三", "·四", "·五", "·六", "·七"]
         role = self.rng.choice(roles)
-        name = f"{self.rng.choice(names)}·{c.name}"
+        given = self.rng.choice(names)
+        # 该文明已有多少位同名（名前缀相同）者，据此加序号后缀避免完全同名。
+        same = sum(1 for p in c.people if p.name.split("·")[0] == given) if c.people else 0
+        suffix = ordinals[min(same, len(ordinals) - 1)]
+        name = f"{given}·{c.name}{suffix}"
         pid = f"{c.id}-p{len(c.people)+1}-{year}"
         return Person(
             id=pid, name=name, role=role, civ_id=c.id,

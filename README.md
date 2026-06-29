@@ -92,9 +92,9 @@ python -m civsim.cli resume saves/world.json
 
 ```
 civsim/
-  models.py     结构化世界状态（Pydantic）—— 文明、人物、事件、纪元
-  engine.py     混合驱动引擎：规则推进 + 涌现 + 玩家事件 + 叙事
-  generators.py 多体裁文本生成器（编年史/日记/诏令/经文/会议纪要）
+  models.py     结构化世界状态（Pydantic）—— 文明、人物、事件、纪元、既成事实(Fact)
+  engine.py     混合驱动引擎：规则推进 + 涌现 + 玩家事件 + 叙事；含寿命分级表
+  generators.py 多体裁文本生成器 + 事后校验层（_violations/_validated）
   providers.py  可插拔 LLM 后端（mock / Anthropic / OpenAI兼容 / 本地）+ 配置文件工厂
   archive.py    档案库：Markdown 落盘 + SQLite 索引
   cli.py        rich 终端交互入口
@@ -105,26 +105,39 @@ archives/       生成的文本档案（即"文明图书馆"）
 saves/          世界存档（JSON）
 ```
 
+## 关键设计
+
+- **混合驱动**：规则维护数值状态，LLM 只叙事不做状态计算（见 `engine.tick` 四步）。
+- **叙事时间真实性**：事件年份散落在 tick 区间内（非整 25/50/75），档案落款用
+  聚焦事件的真实年份（见 `generators._focal_year`）。
+- **既成事实台账 + 事后校验**：防止「死后写日记」「败者翻案」等叙事脱节。引擎在
+  人物死亡/战争胜负时写 `Fact`；生成器把 active facts 作为硬约束喂给 LLM，并在档案
+  产出后用 `_violations` 机械校验、违规则重生成。详见 CONTRIBUTING.md 专节。
+
 ## 给协作者的代码导读
 
 建议按这个顺序读源码（每文件顶部都有模块级 docstring 说明职责与边界）：
 
 1. `models.py` —— 先看数据形状。所有可序列化状态都在这里，理解了字段就理解了世界能表达什么。
+   重点看 `Fact` 与 `World.active_facts`——这是叙事一致性的根基。
 2. `engine.py` —— 看 `tick()` 的四步注释（规则→涌现→玩家事件→叙事），这是整个模拟的心跳。
-3. `generators.py` —— 看 `ArtifactFactory`，每体裁一个方法，决定档案怎么生成。
-4. `providers.py` —— 看 `get_provider()` 工厂与 `LLMProvider` 协议，换后端只动这里。
+   `LIFESPAN_BY_TECH` 是各时代寿命旋钮；`_emerge` 里写 Fact 的位置要看清。
+3. `generators.py` —— 看 `ArtifactFactory`，每体裁一个方法，决定档案怎么生成；
+   再看 `_violations`/`_validated`，理解事后校验如何兜底叙事一致性。
+4. `providers.py` —— 看 `get_provider_from_config` 工厂与 `LLMProvider` 协议，换后端只动这里。
 5. `archive.py` —— 看 `Archive.add/list/read`，档案如何落盘与检索。
 6. `cli.py` —— 交互入口，串起以上各模块。
 
 注释约定：模块级 docstring 讲「这文件做什么、与谁交互」；类/方法 docstring 讲「职责、参数、副作用」；
-行内注释只标「为什么这么做」而非「做了什么」。改代码时请保持同样风格。
+行内注释只标「为什么这么做」而非「做了什么」。改代码时请保持同样风格。详细约定见 CONTRIBUTING.md。
 
 ## 协作约定
 
 - 在 `main` 之外开分支开发，PR 合并。
 - 改动状态字段（`models.py`）时同步更新 `config.yaml` 与存档兼容性说明。
-- 新增 LLM 后端只需在 `providers.py` 实现协议并在 `get_provider()` 注册，不要在引擎/生成器里直接 import SDK。
-- 新增文本体裁只需在 `generators.py` 加一个返回 `Artifact` 的方法并接入 `generate_for_tick`，并在 `archive.Genres` 登记。
+- 新增 LLM 后端只需在 `providers.py` 实现协议并在 `get_provider_from_config` 注册，不要在引擎/生成器里直接 import SDK。
+- 新增文本体裁只需在 `generators.py` 加一个返回 `Artifact` 的方法并接入 `generate_for_tick`，并在 `archive.Genres` 登记；会自动经 `_validated` 校验。
+- 新增不可逆事件（死亡/胜负/政变等）时，记得在引擎里同时写一条 `Fact`，措辞含「不得……」硬约束；校验规则用 id 匹配，不按名字。
 
 ## 后续可扩展
 

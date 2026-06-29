@@ -24,13 +24,46 @@ python -m civsim.cli new-world config.yaml
 
 | 想做的事 | 改哪里 | 注意 |
 |---|---|---|
-| 加/改初始世界 | `config.yaml` | 字段须对应 `models.py`，枚举值用小写字符串/整数 |
-| 加新地貌/政体/科技等级 | `models.py` 枚举 + `engine.py` 相关表 | 同步更新 `BIOME_YIELD`、稳定度均衡点等 |
+| 加/改初始世界 | `config.yaml` | 字段须对应 `models.py`，枚举值用小写字符串/整数；`seed: 0`=每次随机，正整数=可复现 |
+| 加新地貌/政体/科技等级 | `models.py` 枚举 + `engine.py` 相关表 | 同步更新 `BIOME_YIELD`、稳定度均衡点、`LIFESPAN_BY_TECH` 等 |
 | 调整演化难度/节奏 | `engine.py` 的系数 | 系数旁注释会提示影响 |
-| 加新涌现事件 | `engine._emerge` 追加 if 块 | 涌现应是状态阈值 + 可复现随机 |
-| 加新文本体裁 | `generators.py` 加方法 + 接入 `generate_for_tick` + 登记 `archive.Genres` | 返回 `Artifact` 或 `None`（不触发时） |
+| 调整各时代寿命图景 | `engine.LIFESPAN_BY_TECH` | `(衰老起始, 硬上界)`；到上界必死，进窗口后概率递增 |
+| 加新涌现事件 | `engine._emerge` 追加 if 块 | 涌现应是状态阈值 + 可复现随机；若事件确立不可逆事实，同时写 `Fact`（见下节） |
+| 加新文本体裁 | `generators.py` 加方法 + 接入 `generate_for_tick` + 登记 `archive.Genres` | 返回 `Artifact` 或 `None`（不触发时）；会自动经 `_validated` 校验 |
 | 换/加 LLM 后端 | `providers.py` 实现协议 + 注册到 `get_provider`/`get_provider_from_config` | 不要在 engine/generators 直接 import SDK；接入优先走 `llm.yaml` 配置 |
 | 加 CLI 命令 | `cli.run` 的命令分发 | 优先复用 engine 钩子，别直接改 World |
+
+## 既成事实台账与叙事校验（重要设计）
+
+为防止「人物死后还写日记」「败者翻案胜者」这类叙事与状态脱节，系统有两层防护：
+
+**1. 既成事实台账（`models.Fact` / `World.facts`）**
+
+事件（`Event`）是会被遗忘的流水；事实（`Fact`）是写入后永久约束叙事的权威记录。
+引擎在关键节点写 fact：
+
+- 人物辞世 → `engine._emerge` 写 `kind="death"` 的 fact
+- 战争胜负 → `engine._diplomacy_tick` 写 `kind="victory"` 的 fact
+
+生成器通过 `world.active_facts(year)` 取「该年仍生效」的事实，注入 `world_brief`，
+标注「必须遵守，违反即叙事错误」喂给 LLM。新增不可逆事件时，记得同时写一条 fact，
+并在 `statement` 里写清楚「不得……」的硬约束措辞。
+
+**2. 事后校验（`generators._violations` / `_validated`）**
+
+LLM 不 100% 可靠，每个档案产出后由 `_violations` 再扫一遍正文，机械判定：
+
+- death：日记作者在落款年已死（按 `Artifact.author_id` 匹配 `Fact.subject`，**不按名字**——名字会撞名）即违规
+- victory：正文出现「败者击败胜者」翻案措辞即违规
+
+`_validated` 对违规格式重生成最多 2 次，仍违规则告警放行（不丢档案）。
+
+关键约定：
+- **按 id 匹配，不按名字**：`Fact.subject` 与 `Artifact.author_id` 都是 `Person.id`。
+  人物名字库小会撞名，按名字匹配会让同名活人替死人背锅。新增校验规则时务必用 id。
+- **日记作者筛选与校验同口径**：`diary` 候选用 `death_year > focal`（死前还活着可写），
+  校验判定 `art.year >= f.year`（写日记时人已死才违规）。改一方必须同步另一方。
+- `Artifact.author_id` 仅供校验用，`author` 才是展示名。
 
 ## Git 流程
 

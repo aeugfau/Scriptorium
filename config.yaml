@@ -3,7 +3,7 @@
 
 world:
   name: 尤弥尔大陆
-  seed: 42
+  seed: 0                      # 0=每次开局真随机；填任意正整数则该局可复现(同一 seed 出相同结果)
   years_per_tick: 25           # one tick = 25 in-world years
   continents: [北境, 翠原, 焦土]
 

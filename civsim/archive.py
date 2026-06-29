@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import re
 import sqlite3
-import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
@@ -31,19 +30,28 @@ class Artifact:
     year: int
     civ_id: Optional[str] = None
     tick: int = 0
-    author: Optional[str] = None  # person name or institution
+    author: Optional[str] = None      # person name or institution（展示用）
+    author_id: Optional[str] = None   # 若作者是个体人物，存其 Person.id（校验用，避免重名误判）
 
     @property
     def slug(self) -> str:
-        """文件系统安全的 slug，由「年份-标题」生成。
+        """文件名安全的 slug，由「年份-标题」生成，**保留中文**。
 
-        规范化步骤：NFKD 解码 + 丢弃非 ASCII + 非单词字符替换为 ``-``。
-        结果小写、截断到 80 字符，作为文件名一部分。同一标题不同年份不会冲突。
+        为什么保留中文：Windows / macOS / Linux 文件系统都原生支持 Unicode 文件名，
+        用中文标题命名更直观（玩家在文件管理器里一眼能认出是哪篇档案）。
+        早期实现把非 ASCII 全剥光，导致中文标题只剩漏出的数字（如「诺尔海姆诏令·25年」
+        → ``00050-50.md``），既丑又无法区分，属 bug。
+
+        本方法只做「文件系统合法性」处理：把非法字符（``/ \\ : * ? " < > |``）
+        及控制字符替换为 ``-``，折叠连续分隔符，去首尾分隔符，截断到 80 字符。
+        不再强制小写——中文无大小写，且小写会让英文专名变形。
         """
-        s = f"{self.year:05d}-{self.title}"
-        s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
-        s = re.sub(r"[^\w\-]+", "-", s).strip("-")
-        return (s.lower() or "untitled")[:80]
+        s = f"{self.year:04d}-{self.title}"
+        # 替换 Windows/Unix 文件系统非法字符为连字符，并去掉控制字符。
+        s = re.sub(r'[\/\\:*?"<>|\x00-\x1f]', "-", s)
+        # 折叠连续分隔符、去首尾。
+        s = re.sub(r"-{2,}", "-", s).strip("-")
+        return (s or "untitled")[:80]
 
 
 class Archive:
@@ -94,6 +102,14 @@ class Archive:
         genre_dir = self.root / art.genre
         genre_dir.mkdir(parents=True, exist_ok=True)
         path = genre_dir / f"{art.slug}.md"
+
+        # 同名去重：同一 tick 不同文明可能产出标题相近的档案，或重跑模拟产生
+        # 完全相同的标题。已存在文件则在文件名后追加 ``-2``、``-3``……，避免覆盖。
+        if path.exists():
+            stem, n = art.slug, 2
+            while (genre_dir / f"{stem}-{n}.md").exists():
+                n += 1
+            path = genre_dir / f"{stem}-{n}.md"
 
         # Build a readable Markdown document with YAML-ish front matter.
         front = [
