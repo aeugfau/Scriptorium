@@ -59,3 +59,20 @@ print('OK, provider:', p.name, '| artifacts:', len(Archive('archives').list()))
 ```
 
 期望输出 `OK, artifacts: <正数>`。
+
+## 清除已生成的文本档案
+
+每次测试/开发往往会在 `archives/` 留下大量上次游戏的档案，混淆新一轮的产出。
+两种清除方式，都只动 `archives/`，不影响 `saves/` 存档：
+
+```bash
+# 命令行：开新局前一键清空，不进入游戏
+python -m civsim.cli clear
+```
+
+游戏内按 `c` 键可随时清除，会二次确认 `y/N`（防误删一局心血）；命令行
+`clear` 不确认（主动敲的就是要清）。
+
+实现位置：`Archive.clear()`（`archive.py`）负责删 SQLite 索引 + 各体裁目录下
+`.md` 文件并保留目录结构与 `.gitkeep`；`cli.py` 的 `clear` 子命令与游戏内 `c`
+键均调用它。新增体裁时无需改 `clear()`——它按目录遍历，自动覆盖。
