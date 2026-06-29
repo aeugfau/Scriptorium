@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 运行时产物：生成的文本档案与存档
+# 保留目录结构但不入库具体内容；如想提交示例档案，取消下行注释即可
+archives/*
+!archives/.gitkeep
+saves/
+
+# 本地环境变量 / API key（切勿提交）
+.env
+.env.local
+
+# LLM 接入配置：用户填了密钥的真实文件不入库，只提交 .example 模板
+# 首次使用请：cp llm.example.yaml llm.yaml  然后编辑 llm.yaml 填自己的 key
+llm.yaml
+!llm.example.yaml
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+.DS_Store

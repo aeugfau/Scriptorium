@@ -1,0 +1,42 @@
+# Default starting world for civsim.
+# Run a fresh world from this file with:  python -m civsim.cli new-world config.yaml
+
+world:
+  name: 尤弥尔大陆
+  seed: 42
+  years_per_tick: 25           # one tick = 25 in-world years
+  continents: [北境, 翠原, 焦土]
+
+civs:
+  - id: norheim
+    name: 诺尔海姆
+    biome: coastal
+    population: 800
+    food: 120.0
+    wealth: 40.0
+    tech_level: 1            # BRONZE (int; see TechLevel enum)
+    government: chiefdom
+    religion: 海灵信仰
+    culture_traits: [航海, 尚勇, 议事传统]
+    color: cyan
+  - id: verdia
+    name: 翠地亚
+    biome: plains
+    population: 1200
+    food: 150.0
+    wealth: 60.0
+    tech_level: 0            # STONE
+    government: tribal
+    religion: 地母崇拜
+    culture_traits: [农耕, 祭祖, 制陶]
+    color: green
+
+# Initial diplomatic stance matrix (optional; missing pairs default to neutral).
+relations:
+  - [norheim, verdia, trade]
+
+# First era label; the calendar begins here.
+era:
+  name: 黎明纪
+  start_year: 0
+  description: 诸文明于尤弥尔大陆初兴之时。

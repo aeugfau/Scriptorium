@@ -1,0 +1,55 @@
+# =============================================================================
+# Scriptorium · LLM 接入配置（面向最终用户）
+# -----------------------------------------------------------------------------
+# 这个游戏本身不内置任何 AI 模型——你接哪个，它就用哪个。
+# 在本文件里填四项即可，无需改代码、无需设环境变量、无需懂 Python。
+#
+# 字段说明：
+#   provider: 接哪种后端？四选一：
+#       mock      不接任何模型，用内置模板占位。零配置、零费用，用于先跑通流程看效果。
+#       anthropic 接 Claude（官方 API）。质量最高，需 Claude 的 key。
+#       openai    接任何「OpenAI 兼容」的云端 API：DeepSeek / 通义千问 / 智谱 GLM /
+#                 OpenRouter / 硅基流动 等。便宜路线走这条。
+#       local     接本机跑的模型（Ollama / LM Studio / vLLM）。零 API 费用、可离线。
+#                 本质与 openai 相同（都是 OpenAI 兼容端点），只是 base_url 指向本机。
+#   model:    模型 id，填各平台文档里的 model 字符串（示例见下）。
+#   base_url: API 端点。provider 为 openai/local 时必填；anthropic 不用填。
+#   api_key:  你的密钥。mock/local 不用填。
+#
+# 【重要】本文件含密钥时请勿提交到 git（.gitignore 已忽略 llm.yaml 的真实内容，
+#         首次提交的是 llm.example.yaml 模板）。请保管好自己的 key。
+# =============================================================================
+
+# ---- 选项 A：先跑通，不花钱（默认）-----------------------------------------
+provider: mock
+# model / base_url / api_key 都不用填
+
+# ---- 选项 B：接 DeepSeek（你已有 key 的路线，最便宜之一）--------------------
+# DeepSeek 是标准 OpenAI 兼容接口，model 名以平台文档为准：
+#   - 官方 deepseek-chat / deepseek-reasoner
+# 若你的 key 来自聚合/中转平台，model 与 base_url 请用该平台提供的值。
+# provider: openai
+# model: deepseek-chat
+# base_url: https://api.deepseek.com/v1
+# api_key: sk-你的key
+
+# ---- 选项 C：接通义千问 / 智谱 GLM / OpenRouter（同为 OpenAI 兼容）---------
+# 通义:   base_url: https://dashscope.aliyuncs.com/compatible-mode/v1   model: qwen-plus
+# 智谱:   base_url: https://open.bigmodel.cn/api/paas/v4                model: glm-4-flash
+# OpenRouter: base_url: https://openrouter.ai/api/v1                    model: 各家模型名
+# provider: openai
+# model: qwen-plus
+# base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+# api_key: sk-你的key
+
+# ---- 选项 D：接 Claude（质量最高）------------------------------------------
+# provider: anthropic
+# model: claude-sonnet-4-5-20250929
+# api_key: sk-ant-你的key
+
+# ---- 选项 E：本机跑模型（零费用、可离线，需先装 Ollama 并 ollama pull）------
+# 例：ollama pull qwen2.5:14b 后填：
+# provider: local
+# model: qwen2.5:14b
+# base_url: http://localhost:11434/v1
+# api_key: not-needed
