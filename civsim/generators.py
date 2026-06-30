@@ -237,22 +237,33 @@ class ArtifactFactory:
         """
         from .models import SocialClass as _SC, inverse_relation
         ids: list[str] = []
+        judge = getattr(self, "_appellation_judge", None)
         for s in specs:
             name = (s.get("name") or "").strip()
             canonical = (s.get("canonical") or "").strip()
-            # 标准名优先：若 LLM 给了 canonical 且非称谓，用 canonical 归并（处理称谓变体）。
-            # 否则用 name；name 若是明确称谓则弃用（改由 register 生成真名）。
-            key = canonical if canonical and not _looks_like_appellation(canonical) else name
-            if _looks_like_appellation(key):
-                key = ""
+            # 用 LLM 判别称谓（judge）+ 规则兜底：判定 name/canonical 是否称谓。
+            # 称谓则弃用（改由 register 生成真名）；真名则用作归并 key（canonical 优先）。
+            def _is_appe(s):
+                if not s:
+                    return True
+                if judge is not None:
+                    try:
+                        return judge.is_appellation(s)
+                    except Exception:
+                        pass
+                return _looks_like_appellation(s)
+            canon_is_appe = _is_appe(canonical) if canonical else True
+            name_is_appe = _is_appe(name)
+            # 标准名优先：canonical 非称谓则用 canonical 归并（处理称谓变体）；否则用 name。
+            key = canonical if (canonical and not canon_is_appe) else ("" if name_is_appe else name)
             if not key:
                 # 无标准名但带关系：建一张新卡（名字由 register 生成），仍挂关系。
                 if not (s.get("relation") or "").strip():
                     continue
             existing = next((p for p in civ.people if p.name == key), None) if key else None
             # 也按 canonical 在已有卡里找（防止 canonical 是别名、name 是建卡名的情况）。
-            if existing is None and key:
-                existing = next((p for p in civ.people if canonical and canonical == p.name), None)
+            if existing is None and key and canonical and not canon_is_appe:
+                existing = next((p for p in civ.people if canonical == p.name), None)
             bio_event = (s.get("bio_event") or "").strip()
             if existing:
                 # 补全空字段（不覆盖已有权威信息）。
@@ -336,6 +347,10 @@ class ArtifactFactory:
     def set_register_callback(self, cb) -> None:
         """由 Simulation 调用，注入建档回调（让新建卡能挂上寿命/死因机制）。"""
         self._register_cb = cb
+
+    def set_appellation_judge(self, judge) -> None:
+        """由 Simulation 调用，注入称谓判别器（LLM 判断真名 vs 称谓，规则兜底）。"""
+        self._appellation_judge = judge
 
     def chronicle(self, w: World, events: list[Event]) -> Artifact:
         """A history-book chapter covering this tick."""

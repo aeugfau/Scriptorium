@@ -163,8 +163,8 @@ class Simulation:
             self.rng = random.Random()
         # Import lazily to avoid a hard dependency cycle (generators -> engine).
         from .generators import ArtifactFactory
-        from .naming import (BioSummarizer, NameGenerator, PersonPurger,
-                             RoleProposer, VoiceReformer)
+        from .naming import (AppellationJudge, BioSummarizer, NameGenerator,
+                             PersonPurger, RoleProposer, VoiceReformer)
 
         self.factory = ArtifactFactory(self.provider)
         # 命名生成器、角色提议器、文风审定器：LLM 即兴生成，mock 兜底。与叙事生成共用同一 provider。
@@ -174,8 +174,12 @@ class Simulation:
         # 经历精炼器 + 离世清理器：同样 LLM 即兴、mock 兜底。
         self.bio_summarizer = BioSummarizer(self.provider, rng=self.rng)
         self.purger = PersonPurger(self.provider, rng=self.rng)
+        # 称谓判别器：LLM 判断真名 vs 称谓，规则兜底（避免规则误杀真名或漏判称谓）。
+        self.appellation_judge = AppellationJudge(self.provider, rng=self.rng)
         # 把建档回调注入工厂：文本抽取到新人物时，走 register_commoner 挂上寿命/死因机制。
         self.factory.set_register_callback(self.register_commoner)
+        # 把称谓判别器注入工厂：CAST 抽取时判定名字是否称谓。
+        self.factory.set_appellation_judge(self.appellation_judge)
 
     # ------------------------------------------------------------------ step
 

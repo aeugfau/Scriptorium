@@ -50,7 +50,7 @@ class NameGenerator:
         return self._dedupe(civ, names)
 
     def _llm_generate(self, civ: Civilization, count: int, gender: Optional[str]) -> list[str]:
-        """调 LLM 按规范生成名字。要求只返回名字、每行一个。"""
+        """调 LLM 按规范生成名字。要求只返回名字、每行一个。异常/空返回回退 mock。"""
         ns = civ.naming
         gender_hint = f"性别倾向：{gender}。" if ns.gendered and gender else ""
         user = (
@@ -60,18 +60,21 @@ class NameGenerator:
             f"氏族名库：{ns.clans}\n组合模板：{ns.template}\n{gender_hint}\n"
             f"只返回名字，每行一个，不要编号、不要解释。"
         )
-        raw = self.provider.generate(GenRequest(
-            system="你是命名生成器。严格按给定词库与模板风格生成人名，"
-                   "名字需朗朗上口、符合文明气质。只输出名字本身，每行一个。",
-            user=user, context_docs=[], max_tokens=120,
-        ))
+        try:
+            raw = self.provider.generate(GenRequest(
+                system="你是命名生成器。严格按给定词库与模板风格生成人名，"
+                       "名字需朗朗上口、符合文明气质。只输出名字本身，每行一个。",
+                user=user, context_docs=[], max_tokens=120,
+            ))
+        except Exception:
+            raw = ""
         # 解析：每行一个名字，去掉可能的序号/标点。
         names = []
-        for line in raw.splitlines():
+        for line in (raw or "").splitlines():
             s = line.strip().lstrip("0123456789.、-) ").strip()
             if s and len(s) <= 40:
                 names.append(s)
-        # 不足则用 mock 补足，保证数量。
+        # 不足（含空返回/异常）则用 mock 补足，保证数量。
         if len(names) < count:
             names.extend(self._mock_generate(civ, count - len(names)))
         return names[:count]
@@ -179,14 +182,17 @@ class RoleProposer:
             f"clergy/outsider/marginal 中选）。\n"
             f"格式：每行『头衔|阶层』，不要编号、不要解释。"
         )
-        raw = self.provider.generate(GenRequest(
-            system="你是社会结构生成器。提议契合文明历史情境的新身份头衔，"
-                   "头衔应具体、有时代感、不与常见泛称重复。严格按格式输出。",
-            user=user, context_docs=[], max_tokens=150,
-        ))
+        try:
+            raw = self.provider.generate(GenRequest(
+                system="你是社会结构生成器。提议契合文明历史情境的新身份头衔，"
+                       "头衔应具体、有时代感、不与常见泛称重复。严格按格式输出。",
+                user=user, context_docs=[], max_tokens=150,
+            ))
+        except Exception:
+            raw = ""
         out: list[tuple[str, SocialClass]] = []
         valid = {sc.value for sc in SocialClass}
-        for line in raw.splitlines():
+        for line in (raw or "").splitlines():
             if "|" not in line:
                 continue
             title, _, cls = line.strip().partition("|")
@@ -267,15 +273,18 @@ class VoiceReformer:
             f"只对需调整的体裁给出新笔法说明，格式：每行『体裁|新笔法说明』，不要编号、不要解释。\n"
             f"若无调整必要，输出空。"
         )
-        raw = self.provider.generate(GenRequest(
-            system="你是文风审定者。提议契合文明新历史阶段的官方文风微调，"
-                   "笔法说明应具体可执行（如『纪事去颂圣、载公民议』），保留该文明一贯气质。"
-                   "严格按格式输出。",
-            user=user, context_docs=[], max_tokens=180,
-        ))
+        try:
+            raw = self.provider.generate(GenRequest(
+                system="你是文风审定者。提议契合文明新历史阶段的官方文风微调，"
+                       "笔法说明应具体可执行（如『纪事去颂圣、载公民议』），保留该文明一贯气质。"
+                       "严格按格式输出。",
+                user=user, context_docs=[], max_tokens=180,
+            ))
+        except Exception:
+            raw = ""
         out: dict[str, str] = {}
         valid = set(self.GENRES)
-        for line in raw.splitlines():
+        for line in (raw or "").splitlines():
             if "|" not in line:
                 continue
             genre, _, note = line.strip().partition("|")
@@ -306,13 +315,17 @@ class BioSummarizer:
         """返回一句精炼经历，形如「年：...」。mock 兜底用事件描述截断。"""
         if self.provider.name == "mock":
             return f"{year}年：{event_desc[:24]}"
-        raw = self.provider.generate(GenRequest(
-            system="你是人物传记精炼者。把给定事件对某人物的影响浓缩成一句经历（15-30字），"
-                   "只输出这一句，不要年份前缀以外的解释。",
-            user=f"人物：{person.name}（{person.role}，{person.gender or '性别未定'}）。\n"
-                 f"事件：{year}年 {event_desc}\n请精炼成一句该人物的经历。",
-            context_docs=[], max_tokens=60,
-        ))
+        raw = ""
+        try:
+            raw = self.provider.generate(GenRequest(
+                system="你是人物传记精炼者。把给定事件对某人物的影响浓缩成一句经历（15-30字），"
+                       "只输出这一句，不要年份前缀以外的解释。",
+                user=f"人物：{person.name}（{person.role}，{person.gender or '性别未定'}）。\n"
+                     f"事件：{year}年 {event_desc}\n请精炼成一句该人物的经历。",
+                context_docs=[], max_tokens=120,
+            ))
+        except Exception:
+            raw = ""
         line = raw.strip().splitlines()[0].strip() if raw.strip() else event_desc[:24]
         return f"{year}年：{line}"
 
@@ -341,15 +354,87 @@ class PersonPurger:
         """
         if self.provider.name == "mock":
             return not living_relatives_hint
-        raw = self.provider.generate(GenRequest(
-            system="你是人物档案管理者。判断已故且长期未被提及的人物是否可以从活动档案中清理"
-                   "（其关键信息已另存既成事实）。判断依据：是否仍可能被未来文本牵连——"
-                   "如有在世亲属、是重大历史人物则保留。只输出『可删』或『保留』。",
-            user=f"人物：{person.name}（{person.role}，{person.gender or '性别未定'}），"
-                 f"{person.birth_year}–{person.death_year}年，死因{person.cause_of_death}。"
-                 f"经历：{person.bio_entries[:3]}。"
-                 f"有在世亲属提示：{'是' if living_relatives_hint else '否'}。"
-                 f"是否可删？",
-            context_docs=[], max_tokens=10,
-        ))
+        raw = ""
+        try:
+            raw = self.provider.generate(GenRequest(
+                system="你是人物档案管理者。判断已故且长期未被提及的人物是否可以从活动档案中清理"
+                       "（其关键信息已另存既成事实）。判断依据：是否仍可能被未来文本牵连——"
+                       "如有在世亲属、是重大历史人物则保留。只输出『可删』或『保留』。",
+                user=f"人物：{person.name}（{person.role}，{person.gender or '性别未定'}），"
+                     f"{person.birth_year}–{person.death_year}年，死因{person.cause_of_death}。"
+                     f"经历：{person.bio_entries[:3]}。"
+                     f"有在世亲属提示：{'是' if living_relatives_hint else '否'}。"
+                     f"是否可删？",
+                context_docs=[], max_tokens=120,
+            ))
+        except Exception:
+            raw = ""
+        raw = (raw or "").strip()
+        if not raw:
+            # LLM 空返回：保守保留（不删），等下个 tick 再判——避免空返回误删。
+            return False
         return "可删" in raw
+
+
+# ---------------------------------------------------------------------------
+# 称谓判定（LLM 判断 + 规则兜底，避免把真名误判为称谓）
+# ---------------------------------------------------------------------------
+
+
+class AppellationJudge:
+    """判断一个字符串是真名还是称谓/泛称，避免规则误判（如「阿兰」「冉阿让」被当称谓）。
+
+    规则判定（``_looks_like_appellation``）够快但覆盖不全——能稳定识别「小岩儿之父」「阿爸」
+    这类明确称谓，但漏判「秋子之父」「抄经人」等，也可能误杀含「阿」「老」的真名。
+    本类用 LLM 做主判断（更灵活、能处理规则覆盖不到的称谓），规则做兜底：
+
+    - LLM 判为称谓 → 弃用（改按命名规范生成真名）。
+    - LLM 判为真名 → 保留。
+    - LLM 返回空或异常 → 回退规则判定（不当成真名，避免空返回误判）。
+
+    重要：``max_tokens`` 给到 120+——DeepSeek 在 token 预算极小时会返回空串，
+    早期实现因 ``max_tokens=10`` 致空返回，代码把空串当真名，造成「全判真名」假象。
+    """
+
+    # 判定 prompt：明确给正反例，要求「是名字」/「不是名字」二选一。
+    _SYSTEM = (
+        "你是一个姓名判断助手。用户给你一个字符串，判断它是不是一个真实的人名。"
+        "如「张三」「阿兰」「冉阿让」「穆·禾氏」是名字；"
+        "「阿爸」「秋子之父」「二叔」「其母之弟」「抄经人」「老王」是称呼/泛称，不是名字。"
+        "只回答「是名字」或「不是名字」，不要解释。"
+    )
+
+    def __init__(self, provider: LLMProvider, rng: random.Random | None = None):
+        self.provider = provider
+        self.rng = rng or random.Random()
+
+    def is_appellation(self, name: str) -> bool:
+        """返回 name 是否为称谓/泛称（应弃用）而非真名。
+
+        LLM 主判，规则兜底。空返回或异常时回退规则（``_looks_like_appellation``），
+        不把空返回当真名——避免早期实现的「全判真名」bug。
+        """
+        from .generators import _looks_like_appellation
+        if self.provider.name == "mock":
+            # mock 走规则判定，零配置可跑且可复现。
+            return _looks_like_appellation(name)
+        raw = ""
+        try:
+            raw = self.provider.generate(GenRequest(
+                system=self._SYSTEM,
+                user=f"字符串：{name}",
+                context_docs=[], max_tokens=120,
+            ))
+        except Exception:
+            raw = ""
+        raw = (raw or "").strip()
+        if not raw:
+            # LLM 空返回：回退规则，不当成真名。
+            return _looks_like_appellation(name)
+        # 解析：含「不是」→ 称谓；含「是名字/真名/人名」→ 真名。
+        if "不是" in raw or "称谓" in raw or "称呼" in raw or "泛称" in raw:
+            return True
+        if "是名字" in raw or "真名" in raw or "人名" in raw or "是名" in raw:
+            return False
+        # 模糊：回退规则。
+        return _looks_like_appellation(name)
