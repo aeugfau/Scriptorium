@@ -50,19 +50,82 @@ BIOME_YIELD = {
     "tundra": 0.60,
 }
 
-# 按社会发展水平（TechLevel）的寿命区间：(衰老起始年龄, 硬上界年龄)。
+# 按社会发展水平（TechLevel）的寿命区间：(衰老起始, 死亡窗口下界, 死亡窗口上界)。
 # 设计意图：石器/青铜时代均寿短，越往后医疗与社会组织进步、寿命上界抬升。
-# 到「衰老起始」后逐年递增死亡概率，到「硬上界」则必死——避免出现奴隶制社会
-# 活到 179 这类不合理情况。这是可调设计旋钮：改数字即调整各时代寿命图景。
+# - age < 衰老起始：无自然死亡风险。
+# - 衰老起始 <= age < 窗口下界：逐年递增的衰老死亡概率。
+# - 窗口下界 <= age <= 窗口上界：进入「必死窗口」，每人在此区间内随机取一个
+#   个人上限年，到该年必死——避免「到固定某一年集体死亡」的不自然，年龄散布在窗口内。
+# - age > 窗口上界：强制死亡（兜底，理论上不会触发，因个人上限 <= 窗口上界）。
+# 这是可调设计旋钮：改数字即调整各时代寿命图景。
 # 注：当前不预留"个别个体打破年龄上界"的特殊设定（如长生者），后续如需再加。
 LIFESPAN_BY_TECH = {
-    TechLevel.STONE: (45, 60),        # 石器：衰老45起，最迟60
-    TechLevel.BRONZE: (50, 65),       # 青铜
-    TechLevel.IRON: (55, 70),         # 铁器
-    TechLevel.MEDIEVAL: (60, 78),     # 中古
-    TechLevel.RENAISSANCE: (65, 82),  # 文艺复兴
-    TechLevel.INDUSTRIAL: (70, 88),   # 工业化
+    TechLevel.STONE: (40, 50, 60),        # 石器：40起衰，50-60必死窗口
+    TechLevel.BRONZE: (45, 55, 68),       # 青铜
+    TechLevel.IRON: (50, 60, 75),         # 铁器
+    TechLevel.MEDIEVAL: (55, 65, 82),     # 中古
+    TechLevel.RENAISSANCE: (60, 70, 88),  # 文艺复兴
+    TechLevel.INDUSTRIAL: (65, 75, 95),   # 工业化
 }
+
+# 身份关键词 → 意外死亡风险倍率。按 role 头衔含的关键词匹配，反映职业危险性：
+# 渔民/海员风险最高（海难），工匠/矿冶次之（矿塌、灼伤），贵族/祭司最低（远离险地）。
+# 这是可调设计旋钮：改数字即调整各职业意外风险。配合 SOCIAL_CLASS_BASE 叠加。
+ROLE_RISK = {
+    "渔": 3.0, "海": 3.0, "舟": 2.5, "航": 2.5,          # 涉海职业：海难高发
+    "矿": 2.5, "冶": 2.0, "铸": 1.8, "铁": 1.6,          # 矿冶：塌方、灼伤
+    "兵": 2.2, "卫": 1.8, "军": 2.0, "战": 2.2,          # 军人：阵亡
+    "商": 1.5, "行": 1.3,                                 # 行商：遇盗、路途
+    "猎": 1.8, "樵": 1.5,                                 # 山野：野兽、坠崖
+    "农": 1.0, "陶": 1.1, "织": 1.0, "牧": 1.2,          # 农耕：相对安稳
+    "官": 0.6, "廷": 0.6, "议": 0.7,                      # 官僚：远离险地
+    "祭": 0.5, "神": 0.6, "史": 0.5, "学": 0.5,           # 神职/学者：最安
+    "贵": 0.4, "王": 0.5, "督": 0.6,                     # 贵族：最低
+}
+
+# 核心阶层 → 意外风险基准倍率（与 ROLE_RISK 相乘）。军人阶层固有风险，边缘阶层生存条件恶劣。
+SOCIAL_CLASS_BASE = {
+    SocialClass.SOLDIER: 1.5,    # 职业暴力，和平时期也常意外
+    SocialClass.MARGINAL: 1.4,   # 流民/奴隶：无保障、危险营生
+    SocialClass.OUTSIDER: 1.3,   # 外乡人：路途风险
+    SocialClass.ARTISAN: 1.0,
+    SocialClass.COMMONER: 1.0,
+    SocialClass.NOBILITY: 0.7,
+    SocialClass.CLERGY: 0.8,
+}
+
+# 意外死因按身份关键词映射（意外死亡路径用，区别于事件级死因）。
+ACCIDENT_CAUSE = {
+    "渔": "海难", "海": "海难", "舟": "覆舟", "航": "海难",
+    "矿": "矿塌", "冶": "炉祸", "铸": "炉祸", "铁": "锻造之祸",
+    "兵": "阵亡", "卫": "械斗", "军": "阵亡", "战": "战死",
+    "商": "遇盗", "行": "路途之祸", "猎": "兽袭", "樵": "坠崖",
+    "农": "田野之祸", "陶": "窑塌", "织": "走水", "牧": "畜伤",
+    "官": "急病", "廷": "急病", "议": "急病",
+    "祭": "暴病", "神": "暴病", "史": "暴病", "学": "暴病",
+    "贵": "急病", "王": "急病", "督": "急病",
+}
+
+
+def _role_risk(role: str, sclass: SocialClass) -> float:
+    """取该身份的意外风险倍率 = 阶层基准 × 命中的最高 role 关键词倍率。
+
+    role 是自由文本头衔（如「航海长」），可能命中多个关键词（「航」「长」），取最高；
+    无命中则用 1.0。反映「渔民出海意外远大于农民」的直觉。
+    """
+    role_mult = 1.0
+    for kw, mult in ROLE_RISK.items():
+        if kw in role:
+            role_mult = max(role_mult, mult)
+    return role_mult * SOCIAL_CLASS_BASE.get(sclass, 1.0)
+
+
+def _accident_cause(role: str) -> str:
+    """按 role 关键词取意外死因；无命中回退「意外亡故」。"""
+    for kw, cause in ACCIDENT_CAUSE.items():
+        if kw in role:
+            return cause
+    return "意外亡故"
 
 
 @dataclass
@@ -428,45 +491,158 @@ class Simulation:
                     involved_civs=[c.id], magnitude=1.0, source="emergent",
                 ))
             # 名人辞世：按所属文明的社会发展水平（TechLevel）决定寿命。
-            age_start, age_cap = LIFESPAN_BY_TECH.get(c.tech_level, (55, 70))
+            # 区间为 (衰老起始, 必死窗口下界, 必死窗口上界)。进窗口后每人在窗口内
+            # 随机取一个个人寿限 max_age，到该年龄必死——年龄散布在窗口内，非一刀切。
+            age_start, cap_lo, cap_hi = LIFESPAN_BY_TECH.get(c.tech_level, (50, 60, 75))
             for p in list(c.people):
                 if p.death_year is not None:
                     continue
                 age = w.year - p.birth_year
-                # 到硬上界必死；进衰老窗口后按年龄递增概率死亡。
-                must_die = age >= age_cap
+                # 进入必死窗口时，给此人定一个个人寿限（窗口内随机）。
+                # 取 [cap_lo+1, cap_hi] 保证进窗口后至少活 1 年，不致「刚进窗口即死」。
+                if p.max_age is None and age >= cap_lo:
+                    p.max_age = self.rng.randint(cap_lo + 1, cap_hi) if cap_hi > cap_lo else cap_lo
                 in_decline = age >= age_start
-                # 衰老窗口内：年龄越接近上界，死亡概率越高（线性插值到 ~0.5/tick）。
+                in_window = p.max_age is not None  # 已进必死窗口
+                must_die = in_window and age >= p.max_age
+                # 概率：衰老窗口内递增；必死窗口内更高（几年内必死，但非立即）。
                 chance = 0.0
-                if in_decline:
-                    span = max(1, age_cap - age_start)
-                    chance = 0.08 + 0.42 * (age - age_start) / span
-                if must_die or (in_decline and self.rng.random() < chance):
-                    # 死亡年份：
-                    # - 必死（到上界）：取「恰好活到上界」那年 = birth + age_cap，
-                    #   而非区间随机年——否则 dyear 可能超过上界，造成「活过头」记录。
-                    # - 概率死亡：取本 tick 区间内随机年（人在区间内某刻老死）。
-                    dyear = (p.birth_year + age_cap) if must_die else real_year()
+                if in_window:
+                    # 窗口内：随年龄接近 max_age 升至 ~0.6/tick，保证几年内死。
+                    span = max(1, p.max_age - cap_lo)
+                    chance = 0.25 + 0.35 * (age - cap_lo) / span
+                elif in_decline:
+                    span = max(1, cap_lo - age_start)
+                    chance = 0.06 + 0.20 * (age - age_start) / span
+                if must_die or ((in_decline or in_window) and self.rng.random() < chance):
+                    # 死亡年龄须与判定一致：从 [age 起点下界, 当前age] 内取一个死亡年龄，
+                    # 再 dyear = birth + death_age。避免「判定时 52 岁、记录成 38 岁」
+                    # 的脱节（旧实现用 real_year() 区间随机年导致记录年龄偏低且可低于 age_start）。
+                    if must_die:
+                        death_age = p.max_age
+                    elif in_window:
+                        death_age = self.rng.randint(cap_lo, max(cap_lo, age))
+                    else:  # in_decline
+                        death_age = self.rng.randint(age_start, max(age_start, age))
+                    dyear = p.birth_year + death_age
                     # 区间边界保护：dyear 不应早于本 tick 起点，也不晚于当前年。
                     dyear = max(prev_year, min(dyear, w.year))
                     p.death_year = dyear
+                    cause = self._death_cause(c, p, events)
+                    p.cause_of_death = cause
                     events.append(Event(
                         year=dyear, title=f"{p.name} 辞世",
-                        description=f"{c.name} 的 {p.role} {p.name} 于 {dyear} 年离世，享年 {dyear - p.birth_year}。",
+                        description=f"{c.name} 的 {p.role} {p.name} 于 {dyear} 年{cause}离世，"
+                                    f"享年 {dyear - p.birth_year}。",
                         involved_civs=[c.id], magnitude=0.8, source="emergent",
                     ))
-                    # 写入既成事实：此人死亡是永久约束，其后任何档案不得让此人说话/行动。
+                    # 写入既成事实：此人死亡是永久约束，含死因，其后任何档案不得让此人
+                    # 说话/行动，也不得改写其死因。
                     w.facts.append(Fact(
                         id=f"death-{p.id}-{dyear}", kind="death", year=dyear,
                         subject=p.id, scope=p.id,
-                        statement=f"{p.name}（{p.role}）已于 {dyear} 年辞世，"
-                                  f"此后不得再以该人物视角写日记、发言或行动。",
+                        statement=f"{p.name}（{p.role}）已于 {dyear} 年因{cause}辞世，"
+                                  f"此后不得再以该人物视角写日记、发言或行动，"
+                                  f"亦不得改写其死因为其他。",
                     ))
 
         # 文明间外交：≥2 文明时，25% 概率触发一次互动。
         if len(w.civs) >= 2 and self.rng.random() < 0.25:
             events.extend(self._diplomacy_tick(w, prev_year))
+
+        # 非自然死亡：本 tick 区间内，名人可能因「身份相关意外」或「事件级致死」提前死。
+        # 这填补了「战争/瘟疫只削文明数值不杀人物」与「无职业风险」两个缺口。
+        # 注意：在自然衰老死亡循环之后调用，已死人物不会重复处理。
+        events.extend(self._maybe_kill_notables(w, events, prev_year))
         return events
+
+    def _kill_person(self, w: World, c: Civilization, p: Person, dyear: int, cause: str,
+                    events: list[Event]) -> None:
+        """统一的人物死亡落账：设 death_year/cause、记事件、写 Fact。
+
+        自然衰老死亡与事件/意外死亡都走这里，保证死因记录口径一致。
+        """
+        p.death_year = dyear
+        p.cause_of_death = cause
+        events.append(Event(
+            year=dyear, title=f"{p.name} 辞世",
+            description=f"{c.name} 的 {p.role} {p.name} 于 {dyear} 年{cause}离世，"
+                        f"享年 {dyear - p.birth_year}。",
+            involved_civs=[c.id], magnitude=1.2, source="emergent",
+        ))
+        w.facts.append(Fact(
+            id=f"death-{p.id}-{dyear}", kind="death", year=dyear,
+            subject=p.id, scope=p.id,
+            statement=f"{p.name}（{p.role}）已于 {dyear} 年因{cause}辞世，"
+                      f"此后不得再以该人物视角写日记、发言或行动，亦不得改写其死因。",
+        ))
+
+    def _maybe_kill_notables(self, w: World, recent_events: list[Event], prev_year: int) -> list[Event]:
+        """非自然死亡：身份相关意外 + 事件级致死（战争/瘟疫/饥荒）。
+
+        两类来源，每个在世名人都查：
+        1. **事件级致死**：若该文明本 tick 有战争/瘟疫/饥荒事件，涉事名人按事件类型概率被点名
+           （战争 25%、瘟疫 30%、饥荒 15%），死因为「战死/瘟疫/饥荒」。这让重大事件真正带走人物。
+        2. **身份相关意外**：每 tick 按「基础概率 × 阶层基准 × role 风险倍率」判定，反映
+           渔民出海、矿工塌方、士兵阵前等职业风险。死因按 role 关键词映射（如渔→海难）。
+
+        被点名死亡时，dyear 取区间内随机年；同 tick 一人至多死一次（死后跳过）。
+        """
+        events: list[Event] = []
+        # 收集本 tick 各文明的事件致死触发。
+        event_risks: dict[str, list[tuple[float, str]]] = {}  # civ_id -> [(概率, 死因)]
+        for e in recent_events:
+            for cid in e.involved_civs:
+                title = e.title + e.description
+                if "瘟疫" in title:
+                    event_risks.setdefault(cid, []).append((0.30, "瘟疫"))
+                if "饥荒" in title or "断粮" in title:
+                    event_risks.setdefault(cid, []).append((0.15, "饥荒"))
+                if "交战" in title or "战争" in title:
+                    event_risks.setdefault(cid, []).append((0.25, "战死"))
+                if "动荡" in title:
+                    event_risks.setdefault(cid, []).append((0.12, "动乱"))
+
+        ACCIDENT_BASE = 0.006  # 每 tick 基础意外概率（乘风险倍率后约 0.2%~2%/tick）
+        for c in w.civs:
+            triggers = event_risks.get(c.id, [])
+            for p in list(c.people):
+                if p.death_year is not None:
+                    continue
+                # 1) 事件级致死：遍历该文明的所有触发，任一命中即死。
+                died = False
+                for prob, cause in triggers:
+                    if self.rng.random() < prob:
+                        self._kill_person(w, c, p, self.rng.randint(prev_year, w.year), cause, events)
+                        died = True
+                        break
+                if died:
+                    continue
+                # 2) 身份相关意外：基础概率 × 阶层基准 × role 风险倍率。
+                risk = ACCIDENT_BASE * _role_risk(p.role, p.social_class)
+                if self.rng.random() < risk:
+                    cause = _accident_cause(p.role)
+                    self._kill_person(w, c, p, self.rng.randint(prev_year, w.year), cause, events)
+        return events
+
+    def _death_cause(self, c: Civilization, p: Person, recent_events: list[Event]) -> str:
+        """按状态与近期事件给人物确定死因（规则生成，非 LLM）。
+
+        死因必须结构化记录到 ``Person.cause_of_death`` 与 death Fact 中，后续叙事不得改写。
+        当前只在自然死亡路径调用，但会参考近期状态：若文明正饥荒/动荡，则死因可能是
+        "饥荒"/"动乱"，否则多为"年迈"。未来若加入战死/处决/瘟疫等人物级死亡，
+        也应通过本函数或同口径写入 cause_of_death。
+        """
+        titles = " ".join(e.title + e.description for e in recent_events if c.id in e.involved_civs)
+        if "瘟疫" in titles:
+            return "瘟疫"
+        if "饥荒" in titles or c.food < 1:
+            return "饥荒"
+        if "动荡" in titles or c.stability < 25:
+            return "动乱"
+        if "交战" in titles or "战争" in titles:
+            return "战乱余波"
+        return "年迈"
 
     def _diplomacy_tick(self, w: World, prev_year: int) -> list[Event]:
         """随机抽两个文明，按当前关系推进一次外交互动（交战/贸易）。

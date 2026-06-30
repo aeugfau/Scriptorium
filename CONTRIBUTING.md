@@ -27,7 +27,9 @@ python -m civsim.cli new-world config.yaml
 | 加/改初始世界 | `config.yaml` | 字段须对应 `models.py`，枚举值用小写字符串/整数；`seed: 0`=每次随机，正整数=可复现 |
 | 加新地貌/政体/科技等级 | `models.py` 枚举 + `engine.py` 相关表 | 同步更新 `BIOME_YIELD`、稳定度均衡点、`LIFESPAN_BY_TECH` 等 |
 | 调整演化难度/节奏 | `engine.py` 的系数 | 系数旁注释会提示影响 |
-| 调整各时代寿命图景 | `engine.LIFESPAN_BY_TECH` | `(衰老起始, 硬上界)`；到上界必死，进窗口后概率递增 |
+| 调整各时代寿命图景 | `engine.LIFESPAN_BY_TECH` | `(衰老起始, 必死窗口下界, 必死窗口上界)`；进窗口后每人随机取个人寿限 max_age，几年内必死而非立即死 |
+| 加新致死路径（战死/瘟疫/处决等） | `engine._maybe_kill_notables` 或新方法 + 调 `_kill_person` 同口径写 `cause_of_death` | 死因须落 `Person.cause_of_death` 与 death `Fact`；叙事不得改写 |
+| 调身份意外风险 | `engine.ROLE_RISK`（关键词倍率）+ `SOCIAL_CLASS_BASE`（阶层基准）+ `ACCIDENT_CAUSE`（死因映射） | 渔/海最高、贵/祭最低；意外死因按 role 关键词映射（渔→海难） |
 | 加新涌现事件 | `engine._emerge` 追加 if 块 | 涌现应是状态阈值 + 可复现随机；若事件确立不可逆事实，同时写 `Fact`（见下节） |
 | 调命名规范 | `models.NamingStyle` + `config.yaml` 各文明 `naming:` 块 | 词库/模板/style_note 均可演化；引擎在科技/政体变更时调 `_maybe_evolve_naming` |
 | 调社会阶层 | `models.SocialClass` 枚举 + `engine._unlock_classes_for_government` | 核心阶层用枚举（确定性逻辑用）；具体身份头衔走 `role_pool`（LLM 提议） |
