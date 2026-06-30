@@ -185,11 +185,13 @@ class ArtifactFactory:
     CAST_INSTRUCTION = (
         "\n\n文末附一段人物清单（便于建档与前后一致），格式严格如下，无则留空：\n"
         "<CAST>\n姓名|性别|身份头衔|阶层(nobility/commoner/artisan/soldier/clergy/outsider/marginal)|"
-        "居所|性格特征|处境一句话|与作者的关系类型\n"
+        "居所|性格特征|处境一句话|与作者的关系类型|标准名|本篇该人物的关键经历一句话\n"
         "...</CAST>\n每行一人，字段用|分隔，可空。仅列本篇实际出现且有名字的角色（含作者本人）。\n"
         "关系类型用规范词：父/母/子/女/祖父/祖母/孙/叔伯/姑/侄/兄/弟/姊/妹/堂兄/堂弟/"
         "堂姊/堂妹/配偶/夫妻/师/徒/主/仆/朋友/敌/相识。称谓如「阿爸」「二叔」须解析为"
-        "对方姓名 + 关系类型（如「穆·禾氏|男|陶工|commoner|...|父」），不要把称谓当姓名。"
+        "对方姓名 + 关系类型（如「穆·禾氏|男|陶工|commoner|...|父」），不要把称谓当姓名。\n"
+        "标准名：该人物的全名/正名（即便文中用称谓或简称，这里填全名），用于跨篇识别同一人。\n"
+        "关键经历：本篇中该人物做了什么/遭遇了什么，一句话（如「航海遇险获救」），可空。"
     )
 
     def _split_cast(self, raw: str) -> tuple[str, list[dict]]:
@@ -209,13 +211,14 @@ class ArtifactFactory:
                 if not line or "|" not in line:
                     continue
                 parts = [p.strip() for p in line.split("|")]
-                # 补齐到 8 字段
-                while len(parts) < 8:
+                # 补齐到 10 字段
+                while len(parts) < 10:
                     parts.append("")
                 specs.append({
                     "name": parts[0], "gender": parts[1], "role": parts[2],
                     "social_class": parts[3], "home": parts[4],
                     "traits": parts[5], "circumstance": parts[6], "relation": parts[7],
+                    "canonical": parts[8], "bio_event": parts[9],
                 })
         return body, specs
 
@@ -223,9 +226,10 @@ class ArtifactFactory:
                          year: int, genre: str, author: Optional[Person] = None) -> list[str]:
         """归并/建档文本中出现的人物，返回其 Person.id 列表。
 
-        按「名字 + 文明」匹配已存在 Person：命中则补全空字段、更新 last_mentioned_year、
-        记 mentioned_in；未命中则新建 commoner 卡。这保证同一角色跨篇前后一致，
-        并让所有文本人物都有卡。新建用 engine 钩子（Simulation 持有此 factory 的引用）。
+        按「标准名 + 文明」匹配已存在 Person：命中则补全空字段、更新 last_mentioned_year、
+        记 mentioned_in、追加本篇经历；未命中则新建 commoner 卡。标准名优先取 CAST 的
+        ``canonical`` 列（LLM 给的稳定全名），回退到 ``name``——这让同一人即便文中用不同
+        称谓（穆·禾氏 / 老穆 / 二叔）也能识别为同一卡。
 
         若传入 ``author``：对每个 CAST 行带「与作者关系类型」的，建双向结构化关系边——
         author.relations[other_id]=rel，other.relations[author_id]=inverse(rel)。
@@ -235,19 +239,21 @@ class ArtifactFactory:
         ids: list[str] = []
         for s in specs:
             name = (s.get("name") or "").strip()
-            if not name:
-                continue
-            # 若姓名是明确称谓而非真名（如「小岩儿之父」「阿爸」「二叔」），视为无名：
-            # 让 register_commoner 按命名规范生成真名。判定用精确规则（_looks_like_appellation）
-            # ——只弃用明确称谓结构，宁可漏判泛称（老王/抄经人）也不误杀真名（阿兰/冉阿让）。
-            # 关系边照常建（rel 列独立），故弃用名字不影响亲属链接。
-            if _looks_like_appellation(name):
-                name = ""
-            if not name:
-                # 无名但带关系：建一张新卡（名字由 register 生成），仍挂关系。
+            canonical = (s.get("canonical") or "").strip()
+            # 标准名优先：若 LLM 给了 canonical 且非称谓，用 canonical 归并（处理称谓变体）。
+            # 否则用 name；name 若是明确称谓则弃用（改由 register 生成真名）。
+            key = canonical if canonical and not _looks_like_appellation(canonical) else name
+            if _looks_like_appellation(key):
+                key = ""
+            if not key:
+                # 无标准名但带关系：建一张新卡（名字由 register 生成），仍挂关系。
                 if not (s.get("relation") or "").strip():
                     continue
-            existing = next((p for p in civ.people if p.name == name), None) if name else None
+            existing = next((p for p in civ.people if p.name == key), None) if key else None
+            # 也按 canonical 在已有卡里找（防止 canonical 是别名、name 是建卡名的情况）。
+            if existing is None and key:
+                existing = next((p for p in civ.people if canonical and canonical == p.name), None)
+            bio_event = (s.get("bio_event") or "").strip()
             if existing:
                 # 补全空字段（不覆盖已有权威信息）。
                 if not existing.gender and s.get("gender"):
@@ -266,22 +272,34 @@ class ArtifactFactory:
                 existing.last_mentioned_year = year
                 if genre not in existing.mentioned_in:
                     existing.mentioned_in.append(genre)
+                # 追加本篇经历（去重），让人物卡随被提及而成长。
+                if bio_event:
+                    entry = f"{year}年（{genre}）：{bio_event}"
+                    if entry not in existing.bio_entries:
+                        existing.bio_entries.append(entry)
                 pid = existing.id
                 ids.append(pid)
             else:
                 # 新建 commoner 卡：解析阶层，出生年回拨，给 max_age（与寿命机制对齐）。
+                # 建卡名用 key（标准名/真名）；若 key 空则 register 生成。
                 sc = _SC.COMMONER
                 try:
                     if s.get("social_class"):
                         sc = _SC(s["social_class"])
                 except Exception:
                     pass
-                pid = self._register_commoner(civ, name, s.get("role") or "居民",
+                pid = self._register_commoner(civ, key, s.get("role") or "居民",
                                               sc, year, gender=s.get("gender", ""),
                                               home=s.get("home", ""),
                                               traits=[t.strip() for t in s.get("traits", "").replace("、", ",").split(",") if t.strip()],
                                               circumstance=s.get("circumstance", ""))
                 ids.append(pid)
+                # 新卡也记本篇经历。
+                if bio_event:
+                    newp = next((p for p in civ.people if p.id == pid), None)
+                    entry = f"{year}年（{genre}）：{bio_event}"
+                    if newp is not None and entry not in newp.bio_entries:
+                        newp.bio_entries.append(entry)
             # 建双向关系边：CAST 的「与作者关系类型」绑定 author 与此人。
             # 关系类型须是规范词（父/叔伯/配偶…），LLM 偶带括号说明（如「叔伯（之父之弟）」）
             # 或自由短语——清洗为首个规范关系词，否则 inverse_relation 查不到会错建反向边。
