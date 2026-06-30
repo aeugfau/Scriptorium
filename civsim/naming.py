@@ -21,7 +21,7 @@ from __future__ import annotations
 import random
 from typing import Optional
 
-from .models import Civilization, NamingStyle, SocialClass, VoiceStyle
+from .models import Civilization, NamingStyle, Person, SocialClass, VoiceStyle
 from .providers import GenRequest, LLMProvider
 
 
@@ -284,3 +284,72 @@ class VoiceReformer:
             if genre in valid and note:
                 out[genre] = note
         return out
+
+
+# ---------------------------------------------------------------------------
+# 人物经历精炼
+# ---------------------------------------------------------------------------
+
+
+class BioSummarizer:
+    """把人物卷入的事件精炼成一句经历，追加进 ``Person.bio_entries``。
+
+    人物卡随时间「长」：每次人物被重大事件牵连（被点名死、参与战争、被诏令提及等），
+    调本类生成一句精炼总结追加。mock 兜底直接用事件标题。
+    """
+
+    def __init__(self, provider: LLMProvider, rng: random.Random | None = None):
+        self.provider = provider
+        self.rng = rng or random.Random()
+
+    def summarize(self, person: Person, event_desc: str, year: int) -> str:
+        """返回一句精炼经历，形如「年：...」。mock 兜底用事件描述截断。"""
+        if self.provider.name == "mock":
+            return f"{year}年：{event_desc[:24]}"
+        raw = self.provider.generate(GenRequest(
+            system="你是人物传记精炼者。把给定事件对某人物的影响浓缩成一句经历（15-30字），"
+                   "只输出这一句，不要年份前缀以外的解释。",
+            user=f"人物：{person.name}（{person.role}，{person.gender or '性别未定'}）。\n"
+                 f"事件：{year}年 {event_desc}\n请精炼成一句该人物的经历。",
+            context_docs=[], max_tokens=60,
+        ))
+        line = raw.strip().splitlines()[0].strip() if raw.strip() else event_desc[:24]
+        return f"{year}年：{line}"
+
+
+# ---------------------------------------------------------------------------
+# 离世人物清理
+# ---------------------------------------------------------------------------
+
+
+class PersonPurger:
+    """判断已故且长期未被提及的人物是否可删卡，防人物卡无限膨胀。
+
+    全员建档下，人物卡会随时间增长；已故且很久没被任何文本牵连者可清理。
+    删卡前由引擎写 ``Fact(kind="person_archive")`` 存其关键信息，保证历史一致性。
+    LLM 判断「是否仍可能被未来文本牵连」（有在世亲属/重大历史意义等）；mock 兜底按规则。
+    """
+
+    def __init__(self, provider: LLMProvider, rng: random.Random | None = None):
+        self.provider = provider
+        self.rng = rng or random.Random()
+
+    def should_purge(self, person: Person, living_relatives_hint: bool) -> bool:
+        """返回是否可删卡。``living_relatives_hint``：是否有在世同名/同氏族亲属的粗判。
+
+        mock 兜底：已故且有在世亲属提示则保留，否则可删（确定性、可复现）。
+        """
+        if self.provider.name == "mock":
+            return not living_relatives_hint
+        raw = self.provider.generate(GenRequest(
+            system="你是人物档案管理者。判断已故且长期未被提及的人物是否可以从活动档案中清理"
+                   "（其关键信息已另存既成事实）。判断依据：是否仍可能被未来文本牵连——"
+                   "如有在世亲属、是重大历史人物则保留。只输出『可删』或『保留』。",
+            user=f"人物：{person.name}（{person.role}，{person.gender or '性别未定'}），"
+                 f"{person.birth_year}–{person.death_year}年，死因{person.cause_of_death}。"
+                 f"经历：{person.bio_entries[:3]}。"
+                 f"有在世亲属提示：{'是' if living_relatives_hint else '否'}。"
+                 f"是否可删？",
+            context_docs=[], max_tokens=10,
+        ))
+        return "可删" in raw

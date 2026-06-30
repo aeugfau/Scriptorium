@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -32,6 +32,7 @@ class Artifact:
     tick: int = 0
     author: Optional[str] = None      # person name or institution（展示用）
     author_id: Optional[str] = None   # 若作者是个体人物，存其 Person.id（校验用，避免重名误判）
+    mentioned_persons: list[str] = field(default_factory=list)  # 本篇提及的人物 id，便于按人物检索档案
 
     @property
     def slug(self) -> str:

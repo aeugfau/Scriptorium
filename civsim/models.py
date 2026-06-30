@@ -149,25 +149,68 @@ class VoiceStyle(BaseModel):
 
 
 class Person(BaseModel):
-    """重要人物。每个文明只维护少数几位，用于给叙事提供「角色」。
+    """一个人物（名人或平民）的卡片。所有文本中出现的人物都建档，让世界「厚」起来。
 
-    ``role`` 承载具体的身份头衔（如「航海长」「角斗士」），由 LLM 提议、
-    从文明 ``role_pool`` 抽取；``social_class`` 是该身份所属的核心阶层（枚举），
-    供确定性逻辑判断。``bio`` 留空/简短是有意的：丰满生平交给生成器即兴展开，
-    不持久化进状态——避免长篇大论污染结构化数据、也避免跨 tick 不一致。
+    分层：``kind`` 区分 notable（名人，引擎 spawn）/commoner（平民，文本抽取建档）。
+    平民卡也尽量详细——居住、性格、处境、人际关系——让渔民寡妇与宫廷贵妇的视角都鲜活。
+
+    ``bio_entries`` 是「经历条目列表」：人物卷入重大事件时，LLM 精炼一句追加，
+    卡随时间成长（如「丧偶后独自撑起陶坊」「某年瘟疫中失去独子」）。区别于一次性 bio。
+
+    离世清理：已故且长期未被任何文本牵连者，LLM 判断后可删卡；删前把关键信息写
+    ``Fact(kind="person_archive")`` 永久存档，故删卡不丢历史一致性。
     """
 
     id: str                       # 唯一标识，形如 ``norheim-p1-25``
     name: str                     # 显示名
-    role: str                     # 具体身份头衔，如 "航海长"/"角斗士"
+    role: str                     # 具体身份头衔，如 "航海长"/"角斗士"/"陶工"
     social_class: SocialClass = SocialClass.COMMONER  # 所属核心阶层（确定性逻辑用）
     civ_id: str                   # 所属文明 id
+    gender: str = ""              # 性别/社会身份，"男"/"女"/""（空=未指定）；影响视角与命名
     birth_year: int               # 出生年
     death_year: Optional[int] = None  # 卒年；``None`` 表示仍在世
-    cause_of_death: Optional[str] = None  # 死因，如 "年迈"/"饥荒"/"瘟疫"/"战死"；死后写入，约束叙事不得矛盾
-    max_age: Optional[int] = None  # 个人自然寿限；进入必死窗口时按文明寿命区间随机定，到该年龄必死
-    age_note: str = ""            # 年龄段提示，如 "老"/"少年"——给生成器挑视角用，非权威状态
-    bio: str = ""                 # 简短备注，生成器可扩展（不作为权威状态）
+    cause_of_death: Optional[str] = None  # 死因；死后写入，约束叙事不得矛盾
+    max_age: Optional[int] = None  # 个人自然寿限；进入必死窗口时按文明寿命区间随机定
+    age_note: str = ""            # 年龄段提示，如 "老"/"少年"——给生成器挑视角用
+    # --- 身份与生活细节（平民也填，让视角鲜活）---
+    kind: str = "commoner"        # "notable"（名人）| "commoner"（平民）
+    home: str = ""                # 居所/籍贯，如 "霜鲸湾"/"翠原西陲"
+    traits: list[str] = Field(default_factory=list)  # 性格/特征标签，如 ["寡言","嗜酒"]
+    circumstance: str = ""        # 当前处境一句话，如 "丧偶"/"负债"/"新近得子"
+    relations_note: str = ""      # 人际关系简述（自由文本，展示用）
+    # 结构化关系图：对方 Person.id -> 关系类型（如 "父"/"母"/"叔伯"/"兄弟"/"配偶"/"子"）。
+    # 双向：A.relations[B]="父" 时，引擎也设 B.relations[A]="子"。可查询、参与死因/意外判断。
+    relations: dict[str, str] = Field(default_factory=dict)
+    # --- 经历累积 ---
+    bio_entries: list[str] = Field(default_factory=list)  # 经历条目，每条一句精炼，随时间追加
+    # --- 簿记（清理用）---
+    first_seen_year: int = 0      # 首次出现（建档）年
+    last_mentioned_year: int = 0  # 最近被任何档案提及的年；清理机制据此判断
+    mentioned_in: list[str] = Field(default_factory=list)  # 出现在哪些档案（genre 简记）
+
+    @property
+    def bio(self) -> str:
+        """生平摘要 = 经历条目拼接；为兼容旧代码与展示保留。"""
+        return "；".join(self.bio_entries)
+
+
+# 关系类型 → 其逆关系。用于双向建边：A.relations[B]="父" 时 B.relations[A]="子"。
+# 对称关系（配偶/兄弟/姊妹/朋友）逆关系与自身相同。未列出的关系逆为"相识"。
+RELATION_INVERSE = {
+    "父": "子", "母": "女", "子": "父", "女": "母",
+    "祖父": "孙", "祖母": "孙女", "孙": "祖父", "孙女": "祖母",
+    "叔伯": "侄", "姑": "侄", "侄": "叔伯", "侄女": "姑",
+    "兄": "弟", "弟": "兄", "姊": "妹", "妹": "姊",
+    "堂兄": "堂弟", "堂弟": "堂兄", "堂姊": "堂妹", "堂妹": "堂姊",
+    "配偶": "配偶", "夫妻": "夫妻",
+    "师": "徒", "徒": "师", "主": "仆", "仆": "主",
+    "朋友": "朋友", "敌": "敌",
+}
+
+
+def inverse_relation(rel: str) -> str:
+    """取关系的逆（A 对 B 是 rel，则 B 对 A 是其逆）。缺省回退「相识」。"""
+    return RELATION_INVERSE.get(rel, "相识")
 
 
 class Civilization(BaseModel):
@@ -249,6 +292,8 @@ class Fact(BaseModel):
     - 命名变革（naming_reform）：某文明某年改用……命名。
     - 身份涌现（role_emergence）：某文明某年出现『角斗士』这一身份。
     - 文风变革（voice_reform）：某文明某年编年史笔法改为……。
+    - 人物存档（person_archive）：某人物卡被清理前，把其关键信息（名字/role/生卒/死因/经历）
+      永久存档，保证删卡后历史一致性。
 
     ``scope`` 给出生效范围；``holds_until`` 留给"暂时性事实"（如停战），
     永久事实为 None。

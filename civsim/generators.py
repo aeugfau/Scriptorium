@@ -17,8 +17,52 @@ import random
 from typing import Optional
 
 from .archive import Artifact
-from .models import Civilization, Event, World
+from .models import Civilization, Event, Person, SocialClass, World
 from .providers import GenRequest, LLMProvider
+
+
+# 称谓识别：用于 CAST 抽取时区分「真名」与「亲属称谓/泛称」。
+# 设计取舍：宁可漏判（把泛称当真名建卡，后续清理机制会处理），不要误杀真名
+# （如「阿兰」「冉阿让」「老王」可能是真名）。故只在「明确是称谓结构」时弃用：
+# 1) 精确命中亲属称谓词（阿爸/二叔/爹娘/小叔…）；
+# 2) 含「之X」亲属链（小岩儿之父、其母之弟）——「之」连称谓是真名极少见的结构。
+# 不再用宽泛单字关键词（老/小/阿/他），避免误判真名。
+_APPELLATION_EXACT = {"阿爸", "阿妈", "爹", "娘", "爷", "奶", "二叔", "大叔", "小叔",
+                      "大伯", "舅父", "舅母", "婶婶", "堂叔", "表叔"}
+_APPELLATION_KINSHIP_PREFIX = ("之子", "之女", "之父", "之母", "之妻", "之夫",
+                               "之兄", "之弟", "之姊", "之妹", "之叔", "之侄")
+
+
+def _looks_like_appellation(name: str) -> bool:
+    """判 name 是否为明确的亲属称谓（应弃用，改按命名规范生成真名）。
+
+    只在称谓结构明确时判 True：精确命中称谓词，或含「之X」亲属链。
+    「老王」「阿猫」「他二叔」等模糊情况判 False（保留为名，宁可漏判不误杀）。
+    关系边照常建（CAST 的 rel 列独立给出），故弃用名字不影响亲属链接。
+    """
+    n = name.strip()
+    if not n or n in _APPELLATION_EXACT:
+        return True
+    return any(m in n for m in _APPELLATION_KINSHIP_PREFIX)
+
+
+def _normalize_relation(raw: str) -> str:
+    """把 LLM 给的关系字段清洗为规范关系词。
+
+    LLM 偶带括号说明（如「叔伯（小贝里克之父的弟弟）」）或自由短语。取括号前、
+    再匹配 RELATION_INVERSE 的 key；命中则用该规范词，否则原样返回（inverse 会回退相识）。
+    """
+    from .models import RELATION_INVERSE
+    s = raw.split("（")[0].split("(")[0].strip()
+    # 直接命中规范词。
+    if s in RELATION_INVERSE or s in {v for v in RELATION_INVERSE.values()}:
+        return s
+    # 在原串里找包含的规范词（如「之父之弟」含「父」——但优先长词）。
+    keys = sorted(RELATION_INVERSE.keys(), key=len, reverse=True)
+    for k in keys:
+        if k in raw:
+            return k
+    return s
 
 
 class ArtifactFactory:
@@ -31,19 +75,43 @@ class ArtifactFactory:
     # -- helpers -----------------------------------------------------------
 
     def civ_card(self, c: Civilization) -> str:
-        """Compact text snapshot of a civ — the generator's "memory" of it."""
+        """Compact text snapshot of a civ — the generator's "memory" of it.
+
+        全员建档下人物多，不能全列（防爆上下文）：只列名人在世者 + 最近被提及的若干平民，
+        每人含性别/年龄/阶层/处境一行。完整人物卡按需检索（见 _persons_block）。
+        """
         rels = ", ".join(f"{k}:{v.value}" for k, v in c.relations.items()) or "无"
-        people = "; ".join(
-            f"{p.name}({p.role}/{p.social_class.value})"
-            for p in c.people if p.death_year is None
-        ) or "无名人"
+        living = [p for p in c.people if p.death_year is None]
+        # 名人在世者全列；平民只列最近被提及的 8 位。
+        notables = [p for p in living if p.kind == "notable"]
+        commoners = sorted(
+            [p for p in living if p.kind == "commoner"],
+            key=lambda p: p.last_mentioned_year, reverse=True,
+        )[:8]
+        shown = notables + commoners
+
+        def line(p: Person) -> str:
+            bits = [p.name, p.gender or "?", p.age_note or "壮年", p.role, p.social_class.value]
+            if p.home:
+                bits.append(f"居{p.home}")
+            if p.circumstance:
+                bits.append(p.circumstance)
+            # 关系：列出最多 3 条结构化关系（对方名+类型），让 LLM 知晓人物亲属网。
+            # 名字查表局限在本文明（亲属多同文明）；跨文明 id 找不到则显示 id。
+            if p.relations:
+                by_id = {pp.id: pp.name for pp in c.people}
+                rels = [f"{by_id.get(rid, rid)}({rt})" for rid, rt in list(p.relations.items())[:3]]
+                bits.append("关系:" + ",".join(rels))
+            return "/".join(bits)
+
+        people = "; ".join(line(p) for p in shown) or "无在世人物"
         return (
             f"{c.name} [biome={c.biome.value}] 人口{c.population} "
             f"粮储{c.food:.0f} 财富{c.wealth:.0f} 科技={c.tech_level.name}({c.tech_progress:.0f}) "
             f"政体={c.government.value} 信仰={c.religion} 稳定{c.stability:.0f} "
             f"外交:{rels} 命名风格:{c.naming.style_note or '朴素'} "
             f"文风:{c.voice.general} "
-            f"社会阶层:{[s.value for s in c.social_classes]} 名人:{people}"
+            f"社会阶层:{[s.value for s in c.social_classes]} 在世人物({len(living)}):{people}"
         )
 
     def world_brief(self, w: World) -> str:
@@ -106,13 +174,156 @@ class ArtifactFactory:
             voice = civ.voice.for_genre(genre)
             if voice:
                 system = f"{system}\n本文明此体裁的一贯文风须遵循：{voice}"
+        # mock 后端不真正生成 <CAST> 块（会把指令模板原样返回，污染人物卡），
+        # 故 mock 模式剥离 CAST 指令，走空抽取路径。
+        if self.provider.name == "mock":
+            user = user.replace(self.CAST_INSTRUCTION, "")
         return self.provider.generate(GenRequest(system=system, user=user, context_docs=context_docs, max_tokens=max_tokens))
+
+    # -- 人物抽取与建档（让文本中出现的角色都有卡）--------------------------
+
+    CAST_INSTRUCTION = (
+        "\n\n文末附一段人物清单（便于建档与前后一致），格式严格如下，无则留空：\n"
+        "<CAST>\n姓名|性别|身份头衔|阶层(nobility/commoner/artisan/soldier/clergy/outsider/marginal)|"
+        "居所|性格特征|处境一句话|与作者的关系类型\n"
+        "...</CAST>\n每行一人，字段用|分隔，可空。仅列本篇实际出现且有名字的角色（含作者本人）。\n"
+        "关系类型用规范词：父/母/子/女/祖父/祖母/孙/叔伯/姑/侄/兄/弟/姊/妹/堂兄/堂弟/"
+        "堂姊/堂妹/配偶/夫妻/师/徒/主/仆/朋友/敌/相识。称谓如「阿爸」「二叔」须解析为"
+        "对方姓名 + 关系类型（如「穆·禾氏|男|陶工|commoner|...|父」），不要把称谓当姓名。"
+    )
+
+    def _split_cast(self, raw: str) -> tuple[str, list[dict]]:
+        """从 LLM 输出中拆出正文与 <CAST> 人物清单。
+
+        LLM 把人物清单附在文末 <CAST>...</CAST> 块里（每行一人，字段|分隔）。这种「结构化块」
+        比要求 LLM 返回整段 JSON 更稳——正文仍可自由发挥，块可容错解析。无块则视为无抽取。
+        """
+        import re as _re
+        body = raw
+        specs: list[dict] = []
+        m = _re.search(r"<CAST>(.*?)</CAST>", raw, _re.DOTALL)
+        if m:
+            body = (raw[:m.start()] + raw[m.end():]).strip()
+            for line in m.group(1).strip().splitlines():
+                line = line.strip()
+                if not line or "|" not in line:
+                    continue
+                parts = [p.strip() for p in line.split("|")]
+                # 补齐到 8 字段
+                while len(parts) < 8:
+                    parts.append("")
+                specs.append({
+                    "name": parts[0], "gender": parts[1], "role": parts[2],
+                    "social_class": parts[3], "home": parts[4],
+                    "traits": parts[5], "circumstance": parts[6], "relation": parts[7],
+                })
+        return body, specs
+
+    def _resolve_persons(self, w: World, civ: Civilization, specs: list[dict],
+                         year: int, genre: str, author: Optional[Person] = None) -> list[str]:
+        """归并/建档文本中出现的人物，返回其 Person.id 列表。
+
+        按「名字 + 文明」匹配已存在 Person：命中则补全空字段、更新 last_mentioned_year、
+        记 mentioned_in；未命中则新建 commoner 卡。这保证同一角色跨篇前后一致，
+        并让所有文本人物都有卡。新建用 engine 钩子（Simulation 持有此 factory 的引用）。
+
+        若传入 ``author``：对每个 CAST 行带「与作者关系类型」的，建双向结构化关系边——
+        author.relations[other_id]=rel，other.relations[author_id]=inverse(rel)。
+        这让「阿爸」「二叔」等称谓绑定到具体人物卡，且可双向查询（父↔子、叔伯↔侄）。
+        """
+        from .models import SocialClass as _SC, inverse_relation
+        ids: list[str] = []
+        for s in specs:
+            name = (s.get("name") or "").strip()
+            if not name:
+                continue
+            # 若姓名是明确称谓而非真名（如「小岩儿之父」「阿爸」「二叔」），视为无名：
+            # 让 register_commoner 按命名规范生成真名。判定用精确规则（_looks_like_appellation）
+            # ——只弃用明确称谓结构，宁可漏判泛称（老王/抄经人）也不误杀真名（阿兰/冉阿让）。
+            # 关系边照常建（rel 列独立），故弃用名字不影响亲属链接。
+            if _looks_like_appellation(name):
+                name = ""
+            if not name:
+                # 无名但带关系：建一张新卡（名字由 register 生成），仍挂关系。
+                if not (s.get("relation") or "").strip():
+                    continue
+            existing = next((p for p in civ.people if p.name == name), None) if name else None
+            if existing:
+                # 补全空字段（不覆盖已有权威信息）。
+                if not existing.gender and s.get("gender"):
+                    existing.gender = s["gender"]
+                if not existing.home and s.get("home"):
+                    existing.home = s["home"]
+                if s.get("traits"):
+                    for t in s["traits"].replace("、", ",").split(","):
+                        t = t.strip()
+                        if t and t not in existing.traits:
+                            existing.traits.append(t)
+                if not existing.circumstance and s.get("circumstance"):
+                    existing.circumstance = s["circumstance"]
+                if s.get("role") and existing.role in ("居民", ""):
+                    existing.role = s["role"]
+                existing.last_mentioned_year = year
+                if genre not in existing.mentioned_in:
+                    existing.mentioned_in.append(genre)
+                pid = existing.id
+                ids.append(pid)
+            else:
+                # 新建 commoner 卡：解析阶层，出生年回拨，给 max_age（与寿命机制对齐）。
+                sc = _SC.COMMONER
+                try:
+                    if s.get("social_class"):
+                        sc = _SC(s["social_class"])
+                except Exception:
+                    pass
+                pid = self._register_commoner(civ, name, s.get("role") or "居民",
+                                              sc, year, gender=s.get("gender", ""),
+                                              home=s.get("home", ""),
+                                              traits=[t.strip() for t in s.get("traits", "").replace("、", ",").split(",") if t.strip()],
+                                              circumstance=s.get("circumstance", ""))
+                ids.append(pid)
+            # 建双向关系边：CAST 的「与作者关系类型」绑定 author 与此人。
+            # 关系类型须是规范词（父/叔伯/配偶…），LLM 偶带括号说明（如「叔伯（之父之弟）」）
+            # 或自由短语——清洗为首个规范关系词，否则 inverse_relation 查不到会错建反向边。
+            rel = _normalize_relation((s.get("relation") or "").strip())
+            if author is not None and rel and pid != author.id:
+                author.relations[pid] = rel
+                other = next((p for p in civ.people if p.id == pid), None)
+                if other is not None:
+                    other.relations[author.id] = inverse_relation(rel)
+        return ids
+
+    def _register_commoner(self, civ: Civilization, name: str, role: str, sclass,
+                           year: int, **extra) -> str:
+        """新建一个平民人物卡。委托给 Simulation.register_commoner（若可用）。
+
+        ArtifactFactory 不直接持有 Simulation，故通过一个回调注入。若未设置回调
+        （如直接单元测试 factory），退化为就地建卡（不挂 max_age/死因机制，仅展示用）。
+        """
+        cb = getattr(self, "_register_cb", None)
+        if cb is not None:
+            person = cb(civ, name, role, sclass, year, **extra)
+            return person.id if person is not None else ""
+        # 退化路径：就地建卡。
+        from .models import Person
+        pid = f"{civ.id}-c{len(civ.people)+1}-{year}"
+        birth = year - 30
+        civ.people.append(Person(
+            id=pid, name=name, role=role, social_class=sclass, civ_id=civ.id,
+            birth_year=birth, kind="commoner", first_seen_year=year,
+            last_mentioned_year=year, **{k: v for k, v in extra.items() if v},
+        ))
+        return pid
+
+    def set_register_callback(self, cb) -> None:
+        """由 Simulation 调用，注入建档回调（让新建卡能挂上寿命/死因机制）。"""
+        self._register_cb = cb
 
     def chronicle(self, w: World, events: list[Event]) -> Artifact:
         """A history-book chapter covering this tick."""
         y_from = w.year - w.years_per_tick
         y_to = w.year
-        body = self._gen(
+        raw = self._gen(
             system=(
                 "你是一位文明史官，负责撰写编年史。用凝练、庄重的半文言体中文，"
                 "以纪传体/编年体风格记录本时段要事。不杜撰与上文矛盾之事，"
@@ -122,21 +333,43 @@ class ArtifactFactory:
                 f"请撰写 {y_from} 至 {y_to} 年这一时段的编年史章节。"
                 f"凡下文事件已标明年份的，照其年份书写，勿统一改写为整十年/整百年。"
                 f"\n\n本时段要事：\n{self.events_brief(events)}"
+                f"{self.CAST_INSTRUCTION}"
             ),
             context_docs=[self.world_brief(w)],
         )
+        body, specs = self._split_cast(raw)
+        # 编年史不属单一文明；按角色名找到所属文明归并/建档。
+        mentioned: list[str] = []
+        for s in specs:
+            name = (s.get("name") or "").strip()
+            if not name:
+                continue
+            # 找该名所属文明：先在所有文明已有人物里找，找不到则按 CAST 字段里的居所/关系启发
+            # 归入涉及事件的某文明。
+            target_civ = None
+            for c in w.civs:
+                if any(p.name == name for p in c.people):
+                    target_civ = c
+                    break
+            if target_civ is None:
+                # 归入本 tick 涉及的第一个文明（或随机）。
+                involved = next((c for c in w.civs if c.id in [ic for e in events for ic in e.involved_civs]), None)
+                target_civ = involved or self.rng.choice(w.civs)
+            ids = self._resolve_persons(w, target_civ, [s], self._focal_year(w, events), "chronicle")
+            mentioned.extend(ids)
         return Artifact(
             genre="chronicle", title=f"{w.name}编年史·第{w.tick_count}章",
             body=body, year=self._focal_year(w, events), tick=w.tick_count, author="太史馆",
+            mentioned_persons=mentioned,
         )
 
     def diary(self, w: World, events: list[Event], person=None) -> Optional[Artifact]:
-        """A resident's diary entry — pick a living notable, else an anonymous citizen.
+        """A resident's diary entry — pick a living person (notable or commoner), else create one.
 
-        作者必须是**在本日记落款年份仍存活**的人物。已故者不得写日记——
-        这正是「人物死后还能写日记」bug 的修复点。落款年份从本 tick 区间内随机取
-        （:meth:`_year_in_span`），使各篇日记散布在不同年份；若该年作者已死，则排除。
-        无合适名人时退化为匿名居民。注入作者所属文明的日记文风，保证口吻连贯。
+        作者必须是**在本日记落款年份仍存活**的人物。已故者不得写日记。落款年份从本 tick
+        区间内随机取（:meth:`_year_in_span`），各篇散布。无在世人物时不再用「无名之民」——
+        而是当场建档一个详细平民卡（有名字/性别/role/阶层/处境），让平民视角鲜活。
+        生成后抽取文中出现的人物建档，保证配角前后一致。
         """
         focal = self._year_in_span(w)
         candidates = [
@@ -146,24 +379,37 @@ class ArtifactFactory:
         ]
         if candidates:
             who = self.rng.choice(candidates)
-            author = who.name
-            author_id = who.id  # 记 id 而非仅名字：校验按 id 匹配，避免重名误判。
-            # 注入阶层/年龄/具体身份背景，让视角有层次（贵族与边缘流民语气迥异）。
+            author_id = who.id
+            # 注入阶层/年龄/具体身份/性别/处境背景，让视角有层次。
             perspective = (
-                f"你是 {who.name}，{who.age_note or '壮年'}{who.role}"
-                f"（{who.social_class.value}阶层）。此时为 {focal} 年。"
+                f"你是 {who.name}，{who.gender or '人'}，{who.age_note or '壮年'}{who.role}"
+                f"（{who.social_class.value}阶层）"
+                f"{f'，{who.circumstance}' if who.circumstance else ''}。此时为 {focal} 年。"
                 f"用符合你身份与年龄的口吻写日记。"
             )
             civ_id = who.civ_id
             civ = w.civ(who.civ_id)
         else:
-            author = "无名之民"
-            author_id = None
+            # 无在世人物：当场建档一个详细平民作者，而非「无名之民」。
             civ = self.rng.choice(w.civs)
-            perspective = f"你是 {civ.name} 的一名普通居民。此时为 {focal} 年。"
+            sc = self.rng.choice(civ.social_classes) if civ.social_classes else SocialClass.COMMONER
+            role = self.rng.choice(civ.role_pool) if civ.role_pool else "居民"
+            gender = self.rng.choice(["男", "女"])
+            # 用回调建档（名字由 register 按命名规范生成），挂上寿命机制。
+            pid = self._register_commoner(civ, "", role, sc, focal, gender=gender)
+            who = next(p for p in civ.people if p.id == pid)
+            author_id = who.id
+            perspective = (
+                f"你是 {who.name}，{who.gender}，{who.age_note or '壮年'}{who.role}"
+                f"（{who.social_class.value}阶层）。此时为 {focal} 年。"
+                f"用符合你身份与年龄的口吻写日记。"
+            )
             civ_id = civ.id
 
-        body = self._gen(
+        author = who.name
+        # 更新作者最近被提及年。
+        who.last_mentioned_year = focal
+        raw = self._gen(
             system=(
                 "你是一位游戏中的虚构人物，写一篇私人日记。第一人称、口语化、"
                 "带情绪与生活细节，记录本时段影响你的事。120-250字。"
@@ -173,14 +419,19 @@ class ArtifactFactory:
             user=(
                 f"{perspective}\n"
                 f"本时段发生的事：\n{self.events_brief(events)}"
+                f"{self.CAST_INSTRUCTION}"
             ),
             context_docs=[self.world_brief(w)],
             civ=civ, genre="diary",
         )
+        body, specs = self._split_cast(raw)
+        mentioned = self._resolve_persons(w, civ, specs, focal, "diary", author=who)
+        if author_id and author_id not in mentioned:
+            mentioned.append(author_id)
         return Artifact(
             genre="diary", title=f"{author}的日记·{focal}年",
             body=body, year=focal, civ_id=civ_id, tick=w.tick_count,
-            author=author, author_id=author_id,
+            author=author, author_id=author_id, mentioned_persons=mentioned,
         )
 
     def decree(self, w: World, events: list[Event]) -> Optional[Artifact]:
@@ -190,7 +441,7 @@ class ArtifactFactory:
             return None
         civ = self.rng.choice(w.civs)
         year = self._year_in_span(w)  # 诏令落款年从区间内随机取，散布开。
-        body = self._gen(
+        raw = self._gen(
             system=(
                 "你是该文明的统治者，颁布一道诏令/法令。语气威严、正式，"
                 "针对本时段要事给出政令内容与理由。80-180字。以'奉天承运……'或"
@@ -199,14 +450,17 @@ class ArtifactFactory:
             user=(
                 f"颁布地：{civ.name}（政体={civ.government.value}）。落款 {year} 年。\n"
                 f"本时段要事：\n{self.events_brief(events)}"
+                f"{self.CAST_INSTRUCTION}"
             ),
             context_docs=[self.civ_card(civ), self.world_brief(w)],
             civ=civ, genre="decree",
         )
+        body, specs = self._split_cast(raw)
+        mentioned = self._resolve_persons(w, civ, specs, year, "decree")
         return Artifact(
             genre="decree", title=f"{civ.name}诏令·{year}年",
             body=body, year=year, civ_id=civ.id, tick=w.tick_count,
-            author=f"{civ.name}王廷",
+            author=f"{civ.name}王廷", mentioned_persons=mentioned,
         )
 
     def scripture(self, w: World, events: list[Event]) -> Optional[Artifact]:
@@ -215,7 +469,7 @@ class ArtifactFactory:
             return None
         civ = self.rng.choice(w.civs)
         year = self._year_in_span(w)
-        body = self._gen(
+        raw = self._gen(
             system=(
                 "你是本信仰的经文抄写者，写一段经文/偈语/神谕来诠释本时段之事。"
                 "语带玄机、韵律感，可含神祇之名。60-150字。"
@@ -223,14 +477,17 @@ class ArtifactFactory:
             user=(
                 f"信仰背景：{civ.religion}（{civ.name}）。落款 {year} 年。\n"
                 f"需诠释之事：\n{self.events_brief(events)}"
+                f"{self.CAST_INSTRUCTION}"
             ),
             context_docs=[self.civ_card(civ)],
             civ=civ, genre="scripture",
         )
+        body, specs = self._split_cast(raw)
+        mentioned = self._resolve_persons(w, civ, specs, year, "scripture")
         return Artifact(
             genre="scripture", title=f"{civ.religion}经文·{year}年",
             body=body, year=year, civ_id=civ.id, tick=w.tick_count,
-            author=f"{civ.religion}祭司团",
+            author=f"{civ.religion}祭司团", mentioned_persons=mentioned,
         )
 
     def minutes(self, w: World, events: list[Event]) -> Optional[Artifact]:
@@ -239,7 +496,7 @@ class ArtifactFactory:
             return None
         civ = self.rng.choice(w.civs)
         year = self._year_in_span(w)
-        body = self._gen(
+        raw = self._gen(
             system=(
                 "你是会议书记，撰写一份议事会/长老会/议会的会议纪要。"
                 "条目化、严肃、记录议题与议决。150-300字。"
@@ -247,14 +504,17 @@ class ArtifactFactory:
             user=(
                 f"会议方：{civ.name}（{civ.government.value}）。落款 {year} 年。\n"
                 f"议事背景：\n{self.events_brief(events)}"
+                f"{self.CAST_INSTRUCTION}"
             ),
             context_docs=[self.civ_card(civ)],
             civ=civ, genre="minutes",
         )
+        body, specs = self._split_cast(raw)
+        mentioned = self._resolve_persons(w, civ, specs, year, "minutes")
         return Artifact(
             genre="minutes", title=f"{civ.name}议事纪要·{year}年",
             body=body, year=year, civ_id=civ.id, tick=w.tick_count,
-            author="议事会书记",
+            author="议事会书记", mentioned_persons=mentioned,
         )
 
     # -- 校验 -----------------------------------------------------------

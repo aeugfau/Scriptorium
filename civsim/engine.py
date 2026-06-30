@@ -163,13 +163,19 @@ class Simulation:
             self.rng = random.Random()
         # Import lazily to avoid a hard dependency cycle (generators -> engine).
         from .generators import ArtifactFactory
-        from .naming import NameGenerator, RoleProposer, VoiceReformer
+        from .naming import (BioSummarizer, NameGenerator, PersonPurger,
+                             RoleProposer, VoiceReformer)
 
         self.factory = ArtifactFactory(self.provider)
         # 命名生成器、角色提议器、文风审定器：LLM 即兴生成，mock 兜底。与叙事生成共用同一 provider。
         self.name_gen = NameGenerator(self.provider, rng=self.rng)
         self.role_proposer = RoleProposer(self.provider, rng=self.rng)
         self.voice_reformer = VoiceReformer(self.provider, rng=self.rng)
+        # 经历精炼器 + 离世清理器：同样 LLM 即兴、mock 兜底。
+        self.bio_summarizer = BioSummarizer(self.provider, rng=self.rng)
+        self.purger = PersonPurger(self.provider, rng=self.rng)
+        # 把建档回调注入工厂：文本抽取到新人物时，走 register_commoner 挂上寿命/死因机制。
+        self.factory.set_register_callback(self.register_commoner)
 
     # ------------------------------------------------------------------ step
 
@@ -223,6 +229,10 @@ class Simulation:
             line = f"Y{ev.year}: {ev.title}."
             w.chronicle.append(line)
         w.chronicle = w.chronicle[-40:]
+
+        # 离世清理：已故且长期未被提及的人物卡归档删除，防全员建档下的状态膨胀。
+        # 删卡前写 person_archive Fact 存其关键信息，保证历史一致性。
+        self._purge_dead_unreferenced(w)
 
         return TickReport(year=w.year, events=new_events, artifacts_written=len(artifacts))
 
@@ -481,8 +491,10 @@ class Simulation:
                     description=f"民心不稳，{c.name} 境内出现抗议与地方叛乱。",
                     involved_civs=[c.id], magnitude=2.0, source="emergent",
                 ))
-            # 名人出世：每 tick 15% 概率，每文明上限 6 位（控制状态膨胀）。
-            if self.rng.random() < 0.15 and len(c.people) < 6:
+            # 名人出世：每 tick 15% 概率。名人数上限放宽到 8（平民由抽取建档+清理机制管理，
+            # 不在此限）。控制 notable 状态膨胀，但不卡死文本涌现的配角。
+            notable_count = sum(1 for p in c.people if p.kind == "notable" and p.death_year is None)
+            if self.rng.random() < 0.15 and notable_count < 8:
                 p = self._spawn_person(c, w.year)
                 c.people.append(p)
                 events.append(Event(
@@ -703,16 +715,99 @@ class Simulation:
         role = self.rng.choice(c.role_pool) if c.role_pool else "居民"
         # 年龄段：影响视角质感（少年/壮年/老），写入 age_note 供生成器挑视角。
         age_note = self.rng.choice(["少年", "壮年", "壮年", "老"])
+        # 性别：随机；后续若 NamingStyle.gendered 可影响命名。
+        gender = self.rng.choice(["男", "女"])
         # 名字：LLM 按命名规范生成（mock 兜底随机组合），自动去重。
-        names = self.name_gen.generate(c, count=1)
+        names = self.name_gen.generate(c, count=1, gender=gender if c.naming.gendered else None)
         name = names[0] if names else "某人"
         pid = f"{c.id}-p{len(c.people)+1}-{year}"
         birth = year - self.rng.randint(20, 40)
         return Person(
             id=pid, name=name, role=role, social_class=sclass, civ_id=c.id,
-            birth_year=birth, age_note=age_note,
-            bio=f"{c.name} 的一位 {role}。",
+            gender=gender, birth_year=birth, age_note=age_note, kind="notable",
+            first_seen_year=year, last_mentioned_year=year,
+            bio_entries=[f"{year}年：以{role}之姿出现在{c.name}的历史中。"],
         )
+
+    def register_commoner(self, c: Civilization, name: str, role_hint: str,
+                          social_class: SocialClass, year: int,
+                          gender: str = "", home: str = "", traits: list[str] | None = None,
+                          circumstance: str = "", relations_note: str = "") -> Person:
+        """为文本中出现的平民建档（生成器抽取到新人物时调用）。
+
+        逻辑与 _spawn_person 对齐：出生年回拨、按文明寿命区间给 max_age（参与自然死亡
+        与意外死亡机制）、标 kind="commoner"。平民卡也填详细字段让视角鲜活。
+        若 name 为空，按命名规范生成（mock 兜底）。返回新建的 Person（已加入 c.people）。
+        """
+        if not name:
+            names = self.name_gen.generate(c, count=1, gender=gender if c.naming.gendered else None)
+            name = names[0] if names else "某人"
+        if not gender:
+            gender = self.rng.choice(["男", "女"])
+        _, cap_lo, cap_hi = LIFESPAN_BY_TECH.get(c.tech_level, (50, 60, 75))
+        age_now = self.rng.randint(18, 55)
+        birth = year - age_now
+        pid = f"{c.id}-c{len(c.people)+1}-{year}"
+        p = Person(
+            id=pid, name=name or "某人", role=role_hint or "居民",
+            social_class=social_class, civ_id=c.id, gender=gender or self.rng.choice(["男", "女"]),
+            birth_year=birth, age_note=("老" if age_now > 50 else "壮年"),
+            kind="commoner", home=home, traits=traits or [],
+            circumstance=circumstance, relations_note=relations_note,
+            first_seen_year=year, last_mentioned_year=year,
+            bio_entries=[f"{year}年：以{role_hint or '居民'}身份见于记载。"],
+        )
+        c.people.append(p)
+        return p
+
+    def add_bio_entry(self, p: Person, event_desc: str, year: int) -> None:
+        """人物卷入重大事件时，精炼一句经历追加进 ``bio_entries``。LLM 即兴，mock 兜底。"""
+        try:
+            entry = self.bio_summarizer.summarize(p, event_desc, year)
+        except Exception as exc:  # LLM 抖动不拖垮
+            print(f"[civsim] bio_summarizer 失败 ({exc})，用兜底。")
+            entry = f"{year}年：{event_desc[:24]}"
+        if entry not in p.bio_entries:
+            p.bio_entries.append(entry)
+
+    def _purge_dead_unreferenced(self, w: World, stale_years: int = 50) -> int:
+        """清理已故且长期未被提及的人物卡，防膨胀。返回清理数。
+
+        候选：已故 + ``last_mentioned_year`` 早于 ``stale_years`` 年前。
+        对每个候选调 ``PersonPurger`` 判断是否仍可能被未来文本牵连；可删则：
+        先写 ``Fact(kind="person_archive")`` 存其关键信息（删卡不丢历史一致性），再删卡。
+        """
+        purged = 0
+        for c in w.civs:
+            for p in list(c.people):
+                if p.death_year is None:
+                    continue
+                if p.last_mentioned_year == 0 or w.year - p.last_mentioned_year < stale_years:
+                    continue
+                # 粗判在世亲属：同文明是否有同氏族（name 含相同词根）的活人。
+                living_relatives = any(
+                    other.death_year is None and other.id != p.id
+                    and other.name.split("·")[0] == p.name.split("·")[0]
+                    for other in c.people
+                )
+                try:
+                    if not self.purger.should_purge(p, living_relatives):
+                        continue
+                except Exception as exc:
+                    print(f"[civsim] purger 失败 ({exc})，保留。")
+                    continue
+                # 删卡前存档：把关键信息写 person_archive Fact，永久约束叙事一致性。
+                w.facts.append(Fact(
+                    id=f"person-archive-{p.id}", kind="person_archive", year=p.death_year,
+                    subject=p.id, scope=c.id,
+                    statement=(f"{p.name}（{p.role}，{p.gender or '性别未定'}，"
+                               f"{p.birth_year}–{p.death_year}年，死因{p.cause_of_death}）"
+                               f"的人物卡已归档。经历：{'；'.join(p.bio_entries[-3:])}。"
+                               f"此后若文本提及此人，须与上述一致。"),
+                ))
+                c.people.remove(p)
+                purged += 1
+        return purged
 
     # ------------------------------------------------------------- player ev
 
