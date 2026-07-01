@@ -36,7 +36,7 @@ class GenRequest:
     system: str
     user: str
     context_docs: list[str]
-    max_tokens: int = 900
+    max_tokens: int = 1500
 
 
 class LLMProvider(Protocol):

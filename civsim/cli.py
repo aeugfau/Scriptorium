@@ -283,8 +283,16 @@ def main(argv: list[str] | None = None) -> int:
     llm_cfg = None
     if len(argv) >= 3 and argv[2].endswith((".yaml", ".yml")):
         llm_cfg = argv[2]
+        # 用户显式指定了配置文件但文件不存在——明确警告，避免静默降级 mock 让人误以为 LLM 在工作。
+        if not Path(llm_cfg).exists():
+            console.print(f"[yellow]警告：指定的 LLM 配置文件 {llm_cfg} 不存在，"
+                          f"将回退到 llm.yaml 或 mock。常见误因：把第二个参数（存档路径）"
+                          f"误填成了 yaml 文件名。[/yellow]")
     provider, source = get_provider_from_config(llm_cfg or "llm.yaml")
     console.print(f"[dim]LLM 后端: {provider.name}（来源: {source}）[/dim]")
+    if provider.name == "mock":
+        console.print("[yellow]提示：当前为 mock 后端，产出的是占位文本（[mock-llm] 开头），"
+                      "非真实 LLM 生成。检查 llm.yaml 是否正确配置了 provider/model/base_url/api_key。[/yellow]")
     archive = Archive("archives")
 
     if mode == "new-world":

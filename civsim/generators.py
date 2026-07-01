@@ -179,7 +179,7 @@ class ArtifactFactory:
 
     # -- per-genre generators ---------------------------------------------
 
-    def _gen(self, system: str, user: str, context_docs: list[str], max_tokens: int = 900,
+    def _gen(self, system: str, user: str, context_docs: list[str], max_tokens: int = 1500,
              civ: Optional[Civilization] = None, genre: Optional[str] = None) -> str:
         """调 provider 生成文本。若传入 ``civ`` 与 ``genre``，注入该文明该体裁的官方文风。
 
@@ -224,7 +224,18 @@ class ArtifactFactory:
         m = _re.search(r"<CAST>(.*?)</CAST>", raw, _re.DOTALL)
         if m:
             body = (raw[:m.start()] + raw[m.end():]).strip()
-            for line in m.group(1).strip().splitlines():
+            cast_block = m.group(1)
+        else:
+            # 兜底：LLM 偶因 token 用尽未写 </CAST> 闭合标签，正则匹配失败。
+            # 此时若存在 <CAST> 开标签，把其后全部视为 CAST 块剥离，避免残段污染正文。
+            m2 = _re.search(r"<CAST>(.*)$", raw, _re.DOTALL)
+            if m2:
+                body = raw[:m2.start()].strip()
+                cast_block = m2.group(1)
+            else:
+                cast_block = ""
+        if cast_block:
+            for line in cast_block.strip().splitlines():
                 line = line.strip()
                 if not line or "|" not in line:
                     continue
@@ -496,6 +507,26 @@ class ArtifactFactory:
         author = who.name
         # 更新作者最近被提及年。
         who.last_mentioned_year = focal
+        # 跨文明同名检测：若作者名字出现在某条 death Fact 中但 subject 不是
+        # 同一个人（即另一个文明有同名者已死），须在 prompt 中明确澄清归属，
+        # 避免 LLM 因同名混淆而拒写或写出矛盾内容。
+        name_collision_note = ""
+        for f in w.facts:
+            if f.kind != "death" or f.subject == who.id:
+                continue
+            if who.name in f.statement:
+                # 找到另一文明同名死者——从 statement 提取其文明名（现在标在开头）。
+                dead_civ_name = ""
+                for oc in w.civs:
+                    if any(p.id == f.subject for p in oc.people):
+                        dead_civ_name = oc.name
+                        break
+                name_collision_note = (
+                    f"\n【重要】你是 {civ.name} 的 {who.name}（id={who.id}），"
+                    f"与 {dead_civ_name or '另一文明'} 的同名者（已于 {f.year} 年辞世，"
+                    f"id={f.subject}）无关。切勿因同名而混淆身份或误以为自己已死。"
+                )
+                break
         raw = self._gen(
             system=(
                 "你是一位游戏中的虚构人物，写一篇私人日记。第一人称、口语化、"
@@ -507,6 +538,7 @@ class ArtifactFactory:
             user=(
                 f"{perspective}\n"
                 f"本时段发生的事：\n{self.events_brief(events)}"
+                f"{name_collision_note}"
                 f"{self.CAST_INSTRUCTION}"
             ),
             context_docs=[self.world_brief(w)],
@@ -663,11 +695,20 @@ class ArtifactFactory:
         仍违规则返回最后一次结果并打印告警——宁可带瑕疵产出也不要丢档案。
         """
         art = make_art()
+        # 各体裁正文应达到的最小字符数（粗判"明显截断/不完整"）。LLM 偶因 token 用尽
+        # 中途停止（如诏令写到「凡我族人，」就断），正文非空但过短。过短触发重生成。
+        MIN_LEN = {"chronicle": 60, "diary": 50, "decree": 40, "scripture": 30, "minutes": 60}
         for attempt in range(retries):
             vs = self._violations(art, w) if art is not None else []
             # 空 body 也视为违规：DeepSeek 偶发空返回，重生成可救回正文。
             if art is not None and not (art.body or "").strip():
                 vs = vs + ["正文为空"]
+            # 过短视为截断：粗判不完整，重生成。
+            if art is not None:
+                minlen = MIN_LEN.get(art.genre, 40)
+                bodylen = len((art.body or "").strip())
+                if bodylen < minlen:
+                    vs = vs + [f"正文过短({bodylen}字<{minlen})，疑似截断"]
             if not vs:
                 return art
             print(f"[civsim] 校验发现 {len(vs)} 处问题，重生成(第{attempt+1}次): {vs}")

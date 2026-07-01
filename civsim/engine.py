@@ -610,7 +610,7 @@ class Simulation:
                     w.facts.append(Fact(
                         id=f"death-{p.id}-{dyear}", kind="death", year=dyear,
                         subject=p.id, scope=p.id,
-                        statement=f"{p.name}（{p.role}）已于 {dyear} 年因{cause}辞世，"
+                        statement=f"{c.name}的{p.name}（{p.role}）已于 {dyear} 年因{cause}辞世，"
                                   f"此后不得再以该人物视角写日记、发言或行动，"
                                   f"亦不得改写其死因为其他。",
                     ))
@@ -642,7 +642,7 @@ class Simulation:
         w.facts.append(Fact(
             id=f"death-{p.id}-{dyear}", kind="death", year=dyear,
             subject=p.id, scope=p.id,
-            statement=f"{p.name}（{p.role}）已于 {dyear} 年因{cause}辞世，"
+            statement=f"{c.name}的{p.name}（{p.role}）已于 {dyear} 年因{cause}辞世，"
                       f"此后不得再以该人物视角写日记、发言或行动，亦不得改写其死因。",
         ))
 
