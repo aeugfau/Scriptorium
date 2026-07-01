@@ -29,6 +29,8 @@ from .models import (
     Event,
     Fact,
     Government,
+    Organization,
+    OrgType,
     Person,
     Relation,
     SocialClass,
@@ -164,6 +166,7 @@ class Simulation:
         # Import lazily to avoid a hard dependency cycle (generators -> engine).
         from .generators import ArtifactFactory
         from .naming import (AppellationJudge, BioSummarizer, NameGenerator,
+                             OrgMemberInferrer, OrgProposer, OrgPurger,
                              PersonPurger, RoleProposer, VoiceReformer)
 
         self.factory = ArtifactFactory(self.provider)
@@ -176,10 +179,17 @@ class Simulation:
         self.purger = PersonPurger(self.provider, rng=self.rng)
         # 称谓判别器：LLM 判断真名 vs 称谓，规则兜底（避免规则误杀真名或漏判称谓）。
         self.appellation_judge = AppellationJudge(self.provider, rng=self.rng)
+        # 社会组织：涌现提议器 + 清理器 + 成员归入推断器。
+        self.org_proposer = OrgProposer(self.provider, rng=self.rng)
+        self.org_purger = OrgPurger(self.provider, rng=self.rng)
+        self.org_inferrer = OrgMemberInferrer(rng=self.rng)
         # 把建档回调注入工厂：文本抽取到新人物时，走 register_commoner 挂上寿命/死因机制。
         self.factory.set_register_callback(self.register_commoner)
         # 把称谓判别器注入工厂：CAST 抽取时判定名字是否称谓。
         self.factory.set_appellation_judge(self.appellation_judge)
+        # 把组织归入回调注入工厂：新人物建卡时按阶层/CAST 所属组织归入组织。
+        self.factory.set_org_inferrer(self.org_inferrer)
+        self.factory.set_assign_org_cb(self.assign_to_org)
 
     # ------------------------------------------------------------------ step
 
@@ -237,6 +247,8 @@ class Simulation:
         # 离世清理：已故且长期未被提及的人物卡归档删除，防全员建档下的状态膨胀。
         # 删卡前写 person_archive Fact 存其关键信息，保证历史一致性。
         self._purge_dead_unreferenced(w)
+        # 组织清理：阶段1暂无解散触发，留接口待阶段后续。
+        # self._purge_dissolved_orgs(w)
 
         return TickReport(year=w.year, events=new_events, artifacts_written=len(artifacts))
 
@@ -325,23 +337,64 @@ class Simulation:
     # -------------------------------------------------------- naming/role 演化
 
     def _on_tech_up(self, c: Civilization) -> None:
-        """科技升级时：调整命名规范（加新意象词根）+ 提议新身份 + 解锁阶层 + 文风微调。
+        """科技升级时：调整命名规范（加新意象词根）+ 提议新身份 + 解锁阶层 + 文风微调 + 涌现组织。
 
-        规则给基础演化（确定性），LLM 提议新身份/文风（涌现）。各步都写 Fact，
+        规则给基础演化（确定性），LLM 提议新身份/文风/组织（涌现）。各步都写 Fact，
         使「命名/社会结构/文风的变迁」成为可见的文明史。
         """
         trigger = f"tech_{c.tech_level.name.lower()}"
         self._maybe_evolve_naming(c, kind="tech", trigger=trigger)
         self._maybe_propose_roles(c, trigger)
         self._maybe_evolve_voice(c, trigger)
+        self._maybe_propose_orgs(c, trigger)
 
     def _on_gov_change(self, c: Civilization) -> None:
-        """政体更替时：调整命名风格说明 + 提议新身份 + 解锁/调整阶层 + 文风微调。"""
+        """政体更替时：调整命名风格说明 + 提议新身份 + 解锁/调整阶层 + 文风微调 + 涌现组织。"""
         trigger = f"gov_{c.government.value}"
         self._maybe_evolve_naming(c, kind="gov", trigger=trigger)
         self._maybe_propose_roles(c, trigger)
         self._unlock_classes_for_government(c)
         self._maybe_evolve_voice(c, trigger)
+        self._maybe_propose_orgs(c, trigger)
+
+    def _maybe_propose_orgs(self, c: Civilization, trigger: str) -> None:
+        """关键事件时提议涌现新社会组织，建 Organization 并写 Fact(kind="org_emergence")。
+
+        LLM 提议契合文明新阶段的组织（如青铜时代→铜匠行会、君主制→王廷），引擎建卡。
+        人口过阈值的 SETTLEMENT 升级（村→镇）不在此处，留后续。mock 兜底按触发关键词给候选。
+        """
+        try:
+            proposals = self.org_proposer.propose(c, trigger, count=2)
+        except Exception as exc:
+            print(f"[civsim] org_proposer 失败 ({exc})，跳过。")
+            return
+        w = self.world
+        for p in proposals:
+            name = p.get("name", "")
+            otype = p.get("org_type", "other")
+            try:
+                ot = OrgType(otype)
+            except ValueError:
+                ot = OrgType.OTHER
+            parent_name = (p.get("parent_name") or "").strip()
+            parent_id = None
+            if parent_name:
+                for o in c.organizations:
+                    if o.name == parent_name:
+                        parent_id = o.id
+                        break
+            oid = f"{c.id}-org{len(c.organizations)+1}-{w.year}"
+            org = Organization(
+                id=oid, name=name, org_type=ot, civ_id=c.id, parent_org_id=parent_id,
+                founded_year=w.year, last_mentioned_year=w.year,
+                history_entries=[f"{w.year}年：以{ot.value}之姿涌现于{c.name}（{p.get('scale_note','')}）。"],
+            )
+            c.organizations.append(org)
+            w.facts.append(Fact(
+                id=f"org-emergence-{oid}", kind="org_emergence", year=w.year,
+                subject=c.id, scope=c.id,
+                statement=f"{w.year} 年 {c.name} 涌现社会组织「{name}」（{ot.value}）。",
+            ))
 
     def _unlock_classes_for_government(self, c: Civilization) -> None:
         """按政体解锁核心阶层——让「谁能说话」反映社会形态。
@@ -626,10 +679,12 @@ class Simulation:
                 if p.death_year is not None:
                     continue
                 # 1) 事件级致死：遍历该文明的所有触发，任一命中即死。
+                # dyear 取区间内随机年；"享年"用 dyear-birth 真实计算（_kill_person 内）。
                 died = False
                 for prob, cause in triggers:
                     if self.rng.random() < prob:
-                        self._kill_person(w, c, p, self.rng.randint(prev_year, w.year), cause, events)
+                        dyear = self.rng.randint(prev_year, w.year)
+                        self._kill_person(w, c, p, dyear, cause, events)
                         died = True
                         break
                 if died:
@@ -638,7 +693,8 @@ class Simulation:
                 risk = ACCIDENT_BASE * _role_risk(p.role, p.social_class)
                 if self.rng.random() < risk:
                     cause = _accident_cause(p.role)
-                    self._kill_person(w, c, p, self.rng.randint(prev_year, w.year), cause, events)
+                    dyear = self.rng.randint(prev_year, w.year)
+                    self._kill_person(w, c, p, dyear, cause, events)
         return events
 
     def _death_cause(self, c: Civilization, p: Person, recent_events: list[Event]) -> str:
@@ -726,12 +782,43 @@ class Simulation:
         name = names[0] if names else "某人"
         pid = f"{c.id}-p{len(c.people)+1}-{year}"
         birth = year - self.rng.randint(20, 40)
-        return Person(
+        p = Person(
             id=pid, name=name, role=role, social_class=sclass, civ_id=c.id,
             gender=gender, birth_year=birth, age_note=age_note, kind="notable",
             first_seen_year=year, last_mentioned_year=year,
             bio_entries=[f"{year}年：以{role}之姿出现在{c.name}的历史中。"],
         )
+        # 名人按概率归入一个组织（常为 officer）；按阶层/role/home 推断兜底。
+        self.assign_to_org(p, c, home="")
+        return p
+
+    def assign_to_org(self, person: Person, civ: Civilization, home: str = "",
+                      explicit_org_id: str = "") -> None:
+        """把人物归入组织，建双向成员关系（组织 members + Person.orgs）。
+
+        优先用 CAST 显式给的所属组织（``explicit_org_id``，需校验存在）；否则按
+        阶层/role/home 推断（OrgMemberInferrer）。无合适组织则暂留空，等后续涌现。
+        """
+        org = None
+        if explicit_org_id:
+            for o in civ.organizations:
+                if o.id == explicit_org_id and o.dissolved_year is None:
+                    org = o
+                    break
+        if org is None:
+            oid = self.org_inferrer.infer(civ, person.social_class, person.role, home)
+            if oid:
+                for o in civ.organizations:
+                    if o.id == oid and o.dissolved_year is None:
+                        org = o
+                        break
+        if org is None:
+            return
+        if person.id not in org.members:
+            org.members.append(person.id)
+            org.last_mentioned_year = max(org.last_mentioned_year, person.last_mentioned_year)
+        if org.id not in person.orgs:
+            person.orgs.append(org.id)
 
     def register_commoner(self, c: Civilization, name: str, role_hint: str,
                           social_class: SocialClass, year: int,
@@ -746,6 +833,19 @@ class Simulation:
         if not name:
             names = self.name_gen.generate(c, count=1, gender=gender if c.naming.gendered else None)
             name = names[0] if names else "某人"
+        # 跨时间同名防护：若该文明已有同名人物（含已故未清理），加序号后缀避免新角色
+        # 冒充旧人致年龄/经历矛盾（如「汀·锚石氏」4年老人 + 94年同名新人被误认为同一人）。
+        # 注意：归并命中已有在世同名的场景不在 register（走 _resolve_persons 的 existing 分支），
+        # 故此处只可能是「真新角色撞了旧名」——加序号区分。
+        existing_same = [p for p in c.people if p.name == name]
+        if existing_same:
+            ordinals = ["", "·二", "·三", "·四", "·五", "·六", "·七"]
+            i = 1
+            for o in ordinals[1:]:
+                if not any(p.name == f"{name}{o}" for p in c.people):
+                    name = f"{name}{o}"
+                    break
+                i += 1
         if not gender:
             gender = self.rng.choice(["男", "女"])
         _, cap_lo, cap_hi = LIFESPAN_BY_TECH.get(c.tech_level, (50, 60, 75))
@@ -762,6 +862,9 @@ class Simulation:
             bio_entries=[f"{year}年：以{role_hint or '居民'}身份见于记载。"],
         )
         c.people.append(p)
+        # 按 home/阶层归入组织；CAST 给的显式 org_id 由生成器侧传入（见 factory 调用），
+        # 这里 register 不直接接 explicit_org 参数——生成器在建卡后另行调 assign_to_org。
+        self.assign_to_org(p, c, home=home)
         return p
 
     def add_bio_entry(self, p: Person, event_desc: str, year: int) -> None:

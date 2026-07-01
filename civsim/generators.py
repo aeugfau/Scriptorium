@@ -17,7 +17,7 @@ import random
 from typing import Optional
 
 from .archive import Artifact
-from .models import Civilization, Event, Person, SocialClass, World
+from .models import Civilization, Event, Organization, Person, SocialClass, World
 from .providers import GenRequest, LLMProvider
 
 
@@ -105,13 +105,27 @@ class ArtifactFactory:
             return "/".join(bits)
 
         people = "; ".join(line(p) for p in shown) or "无在世人物"
+        # 社会组织：列存续组织（名/类型/隶属/规模），让 LLM 写作时知晓并引用。
+        # 限制最近提及 N 个防爆上下文；LLM 只能引用这些既有组织，不得新造具体组织名。
+        living_orgs = sorted(
+            [o for o in c.organizations if o.dissolved_year is None],
+            key=lambda o: o.last_mentioned_year, reverse=True,
+        )[:10]
+        org_by_id = {o.id: o.name for o in c.organizations}
+        org_lines = []
+        for o in living_orgs:
+            parent = f"隶属于{org_by_id.get(o.parent_org_id, '?')}" if o.parent_org_id else ""
+            members_n = len(o.members)
+            org_lines.append(f"{o.name}({o.org_type.value},成员{members_n}{parent})")
+        orgs = "; ".join(org_lines) or "无存续组织"
         return (
             f"{c.name} [biome={c.biome.value}] 人口{c.population} "
             f"粮储{c.food:.0f} 财富{c.wealth:.0f} 科技={c.tech_level.name}({c.tech_progress:.0f}) "
             f"政体={c.government.value} 信仰={c.religion} 稳定{c.stability:.0f} "
             f"外交:{rels} 命名风格:{c.naming.style_note or '朴素'} "
             f"文风:{c.voice.general} "
-            f"社会阶层:{[s.value for s in c.social_classes]} 在世人物({len(living)}):{people}"
+            f"社会阶层:{[s.value for s in c.social_classes]} 在世人物({len(living)}):{people} "
+            f"社会组织(存续):{orgs}"
         )
 
     def world_brief(self, w: World) -> str:
@@ -125,7 +139,9 @@ class ArtifactFactory:
             f"世界 {w.name}，当前 {w.year} 年（第{w.tick_count}纪元之轮）。\n"
             f"诸文明状态：\n{civ_cards}\n"
             f"近年要事：\n{chronicle}\n"
-            f"既成事实（必须遵守，违反即叙事错误）：\n{facts_block}"
+            f"既成事实（必须遵守，违反即叙事错误）：\n{facts_block}\n"
+            f"社会组织约束：文本中只能引用上文已列出的存续社会组织，不得新造具体组织名"
+            f"（泛称场所如村/市集/路口不限）；人物所属组织须与上文一致。"
         )
 
     def events_brief(self, events: list[Event]) -> str:
@@ -185,13 +201,15 @@ class ArtifactFactory:
     CAST_INSTRUCTION = (
         "\n\n文末附一段人物清单（便于建档与前后一致），格式严格如下，无则留空：\n"
         "<CAST>\n姓名|性别|身份头衔|阶层(nobility/commoner/artisan/soldier/clergy/outsider/marginal)|"
-        "居所|性格特征|处境一句话|与作者的关系类型|标准名|本篇该人物的关键经历一句话\n"
+        "居所|性格特征|处境一句话|与作者的关系类型|标准名|本篇该人物的关键经历一句话|所属组织名\n"
         "...</CAST>\n每行一人，字段用|分隔，可空。仅列本篇实际出现且有名字的角色（含作者本人）。\n"
         "关系类型用规范词：父/母/子/女/祖父/祖母/孙/叔伯/姑/侄/兄/弟/姊/妹/堂兄/堂弟/"
         "堂姊/堂妹/配偶/夫妻/师/徒/主/仆/朋友/敌/相识。称谓如「阿爸」「二叔」须解析为"
         "对方姓名 + 关系类型（如「穆·禾氏|男|陶工|commoner|...|父」），不要把称谓当姓名。\n"
         "标准名：该人物的全名/正名（即便文中用称谓或简称，这里填全名），用于跨篇识别同一人。\n"
-        "关键经历：本篇中该人物做了什么/遭遇了什么，一句话（如「航海遇险获救」），可空。"
+        "关键经历：本篇中该人物做了什么/遭遇了什么，一句话（如「航海遇险获救」），可空。\n"
+        "所属组织名：该人物所属的既有社会组织名（须是上文已列出的存续组织）或其标准名，可空。"
+        "不得新造组织名。"
     )
 
     def _split_cast(self, raw: str) -> tuple[str, list[dict]]:
@@ -211,16 +229,26 @@ class ArtifactFactory:
                 if not line or "|" not in line:
                     continue
                 parts = [p.strip() for p in line.split("|")]
-                # 补齐到 10 字段
-                while len(parts) < 10:
+                # 补齐到 11 字段
+                while len(parts) < 11:
                     parts.append("")
                 specs.append({
                     "name": parts[0], "gender": parts[1], "role": parts[2],
                     "social_class": parts[3], "home": parts[4],
                     "traits": parts[5], "circumstance": parts[6], "relation": parts[7],
-                    "canonical": parts[8], "bio_event": parts[9],
+                    "canonical": parts[8], "bio_event": parts[9], "org_name": parts[10],
                 })
         return body, specs
+
+    def _org_id_by_name(self, civ: Civilization, name: str) -> Optional[str]:
+        """按名查该文明的存续组织 id（CAST 的「所属组织」列校验用）。命中则返回 id，否则 None。"""
+        n = (name or "").strip()
+        if not n:
+            return None
+        for o in civ.organizations:
+            if o.dissolved_year is None and (o.name == n):
+                return o.id
+        return None
 
     def _resolve_persons(self, w: World, civ: Civilization, specs: list[dict],
                          year: int, genre: str, author: Optional[Person] = None) -> list[str]:
@@ -290,6 +318,13 @@ class ArtifactFactory:
                         existing.bio_entries.append(entry)
                 pid = existing.id
                 ids.append(pid)
+                # 已有卡：若 CAST 给了存在的所属组织，把此人加进去（双向），否则不动。
+                org_name = (s.get("org_name") or "").strip()
+                org_id = self._org_id_by_name(civ, org_name) if org_name else None
+                if org_id:
+                    cb = getattr(self, "_assign_org_cb", None)
+                    if cb is not None:
+                        cb(existing, civ, home=existing.home, explicit_org_id=org_id)
             else:
                 # 新建 commoner 卡：解析阶层，出生年回拨，给 max_age（与寿命机制对齐）。
                 # 建卡名用 key（标准名/真名）；若 key 空则 register 生成。
@@ -311,6 +346,14 @@ class ArtifactFactory:
                     entry = f"{year}年（{genre}）：{bio_event}"
                     if newp is not None and entry not in newp.bio_entries:
                         newp.bio_entries.append(entry)
+                # 若 CAST 给了存在的所属组织，用显式组织覆盖 register 的推断归入。
+                org_name = (s.get("org_name") or "").strip()
+                org_id = self._org_id_by_name(civ, org_name) if org_name else None
+                if org_id:
+                    newp = next((p for p in civ.people if p.id == pid), None)
+                    cb = getattr(self, "_assign_org_cb", None)
+                    if newp is not None and cb is not None:
+                        cb(newp, civ, home=s.get("home", ""), explicit_org_id=org_id)
             # 建双向关系边：CAST 的「与作者关系类型」绑定 author 与此人。
             # 关系类型须是规范词（父/叔伯/配偶…），LLM 偶带括号说明（如「叔伯（之父之弟）」）
             # 或自由短语——清洗为首个规范关系词，否则 inverse_relation 查不到会错建反向边。
@@ -351,6 +394,14 @@ class ArtifactFactory:
     def set_appellation_judge(self, judge) -> None:
         """由 Simulation 调用，注入称谓判别器（LLM 判断真名 vs 称谓，规则兜底）。"""
         self._appellation_judge = judge
+
+    def set_org_inferrer(self, inferrer) -> None:
+        """由 Simulation 调用，注入组织归入推断器（CAST 未给所属组织时兜底归入）。"""
+        self._org_inferrer = inferrer
+
+    def set_assign_org_cb(self, cb) -> None:
+        """由 Simulation 调用，注入组织归入回调（建双向成员关系）。"""
+        self._assign_org_cb = cb
 
     def chronicle(self, w: World, events: list[Event]) -> Artifact:
         """A history-book chapter covering this tick."""
@@ -414,11 +465,13 @@ class ArtifactFactory:
             who = self.rng.choice(candidates)
             author_id = who.id
             # 注入阶层/年龄/具体身份/性别/处境背景，让视角有层次。
+            age_num = focal - who.birth_year
             perspective = (
-                f"你是 {who.name}，{who.gender or '人'}，{who.age_note or '壮年'}{who.role}"
+                f"你是 {who.name}，{who.gender or '人'}，{age_num}岁（{who.age_note or '壮年'}），{who.role}"
                 f"（{who.social_class.value}阶层）"
                 f"{f'，{who.circumstance}' if who.circumstance else ''}。此时为 {focal} 年。"
-                f"用符合你身份与年龄的口吻写日记。"
+                f"你的口吻须严格符合{age_num}岁之人的阅历与心境（少年轻率、壮年干练、老者沧桑），"
+                f"不得写出与{age_num}岁年龄不符的言行或经历。"
             )
             civ_id = who.civ_id
             civ = w.civ(who.civ_id)
@@ -432,10 +485,11 @@ class ArtifactFactory:
             pid = self._register_commoner(civ, "", role, sc, focal, gender=gender)
             who = next(p for p in civ.people if p.id == pid)
             author_id = who.id
+            age_num = focal - who.birth_year
             perspective = (
-                f"你是 {who.name}，{who.gender}，{who.age_note or '壮年'}{who.role}"
+                f"你是 {who.name}，{who.gender}，{age_num}岁（{who.age_note or '壮年'}）{who.role}"
                 f"（{who.social_class.value}阶层）。此时为 {focal} 年。"
-                f"用符合你身份与年龄的口吻写日记。"
+                f"你的口吻须严格符合{age_num}岁之人的阅历与心境，不得写出与年龄不符的言行。"
             )
             civ_id = civ.id
 
@@ -446,7 +500,8 @@ class ArtifactFactory:
             system=(
                 "你是一位游戏中的虚构人物，写一篇私人日记。第一人称、口语化、"
                 "带情绪与生活细节，记录本时段影响你的事。120-250字。"
-                "口吻须符合你的阶层与年龄身份（贵族矜持、工匠务实、边缘人困顿等）。"
+                "口吻须严格符合你的阶层与年龄身份：少年轻率、壮年干练、老者沧桑；"
+                "不得写出与作者年龄/处境不符的言行或经历（如老人不得写少年心事、农夫不得写朝堂事）。"
                 "严格遵守既成事实：已辞世之人不得作为日记作者出现，也不得在文中说话行动。"
             ),
             user=(
@@ -603,18 +658,23 @@ class ArtifactFactory:
         """调用生成器并校验，违规则重生成，最多 ``retries`` 次。
 
         ``make_art`` 是无参闭包，返回新 Artifact（每次重生成调一次，LLM 因温度有差异）。
+        校验两类问题：① 既成事实违规（``_violations``）；② **正文为空**（LLM 偶发空返回，
+        如 BodyGuard 不查会落盘空档案）。任一问题触发重生成。
         仍违规则返回最后一次结果并打印告警——宁可带瑕疵产出也不要丢档案。
         """
         art = make_art()
         for attempt in range(retries):
             vs = self._violations(art, w) if art is not None else []
+            # 空 body 也视为违规：DeepSeek 偶发空返回，重生成可救回正文。
+            if art is not None and not (art.body or "").strip():
+                vs = vs + ["正文为空"]
             if not vs:
                 return art
-            print(f"[civsim] 校验发现 {len(vs)} 处违规，重生成(第{attempt+1}次): {vs}")
+            print(f"[civsim] 校验发现 {len(vs)} 处问题，重生成(第{attempt+1}次): {vs}")
             art = make_art()
         # 仍违规：记录后放行（避免死循环/丢档案）。
         if art is not None:
-            print(f"[civsim] 经 {retries} 次重生成仍有违规，放行: {self._violations(art, w)}")
+            print(f"[civsim] 经 {retries} 次重生成仍有问题，放行: {self._violations(art, w)}")
         return art
 
     # -- dispatch ----------------------------------------------------------

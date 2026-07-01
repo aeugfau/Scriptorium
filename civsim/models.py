@@ -102,6 +102,24 @@ class SocialClass(str, Enum):
     MARGINAL = "marginal"    # 边缘：奴隶/流民/异教徒/寡妇等
 
 
+class OrgType(str, Enum):
+    """社会组织类型（枚举骨架）——确定性逻辑用，具体组织自由命名。
+
+    与 SocialClass 同模式：核心类型用枚举（便于「谁能发诏令」「战争消耗哪类组织」等
+    确定性判断），具体组织名（如「霜鲸湾渔会」「海灵教会」「黎明议事会」）是自由文本，
+    由 LLM 提议涌现。新类型原则上由枚举扩展，不靠自由文本类型——保证可判定。
+    """
+
+    SETTLEMENT = "settlement"  # 聚落：村/镇/城
+    CHURCH = "church"          # 教会/堂会
+    GUILD = "guild"            # 行会/商队
+    SCHOOL = "school"          # 学堂/大学
+    COUNCIL = "council"       # 议会/议事会
+    FIEF = "fief"             # 封地/领
+    ARMY = "army"             # 军队/军团
+    OTHER = "other"           # 兜底：其他
+
+
 # ---------------------------------------------------------------------------
 # 核心模型
 # ---------------------------------------------------------------------------
@@ -187,6 +205,7 @@ class Person(BaseModel):
     first_seen_year: int = 0      # 首次出现（建档）年
     last_mentioned_year: int = 0  # 最近被任何档案提及的年；清理机制据此判断
     mentioned_in: list[str] = Field(default_factory=list)  # 出现在哪些档案（genre 简记）
+    orgs: list[str] = Field(default_factory=list)  # 所属组织 id 列表（与 Organization.members 双向）
 
     @property
     def bio(self) -> str:
@@ -211,6 +230,32 @@ RELATION_INVERSE = {
 def inverse_relation(rel: str) -> str:
     """取关系的逆（A 对 B 是 rel，则 B 对 A 是其逆）。缺省回退「相识」。"""
     return RELATION_INVERSE.get(rel, "相识")
+
+
+class Organization(BaseModel):
+    """一个社会组织（村/镇/教会/议会/行会/学堂...）。文明内部的可持久化实体。
+
+    与 Person 对称：有生命周期（涌现→发展→解散）、经历条目（history_entries）、
+    纵向隶属（parent_org_id）、成员关系（members/officers，双向——Person.orgs 也存）。
+    涌现由 LLM 提议（OrgProposer），写 Fact(kind="org_emergence")；解散时由
+    OrgPurger 判断后写 Fact(kind="org_dissolve") 存关键信息再删。
+
+    写作时 LLM 只能引用既有组织（约束式生成，见 generators.civ_card 注入的硬约束），
+    不得新造具体组织名——从源头堵，不做组织 CAST 抽取块/事后校验。
+    """
+
+    id: str                       # 唯一标识，如 norheim-org1-25
+    name: str                     # 自由命名，如「霜鲸湾渔会」「海灵教会」
+    org_type: OrgType             # 类型骨架（确定性逻辑用）
+    civ_id: str                   # 所属文明 id
+    parent_org_id: Optional[str] = None  # 纵向隶属：上级组织 id
+    members: list[str] = Field(default_factory=list)  # 成员 Person.id 列表
+    officers: dict[str, str] = Field(default_factory=dict)  # 职位名 -> Person.id
+    founded_year: int = 0
+    dissolved_year: Optional[int] = None  # 解散年；None 表示存续
+    status: str = "stable"        # 状态：prospering/stable/declining，影响清理与事件
+    history_entries: list[str] = Field(default_factory=list)  # 经历条目
+    last_mentioned_year: int = 0  # 最近被提及年（清理用）
 
 
 class Civilization(BaseModel):
@@ -239,6 +284,8 @@ class Civilization(BaseModel):
     social_classes: list[SocialClass] = Field(default_factory=lambda: [SocialClass.COMMONER])  # 已解锁核心阶层
     role_pool: list[str] = Field(default_factory=list)  # 已涌现的具体身份头衔（LLM 提议扩充），spawn 时抽取
     voice: VoiceStyle = Field(default_factory=VoiceStyle)  # 官方文风（按体裁），可演化（见 naming.VoiceReformer）
+    # --- 社会组织 ---
+    organizations: list[Organization] = Field(default_factory=list)  # 文明内部组织，LLM 提议涌现
     # --- 外交：对方 civ_id -> 本文明对其的立场 ---
     relations: dict[str, Relation] = Field(default_factory=dict)  # engine._diplomacy_tick 维护
     # --- 人物 ---
@@ -294,6 +341,8 @@ class Fact(BaseModel):
     - 文风变革（voice_reform）：某文明某年编年史笔法改为……。
     - 人物存档（person_archive）：某人物卡被清理前，把其关键信息（名字/role/生卒/死因/经历）
       永久存档，保证删卡后历史一致性。
+    - 组织涌现（org_emergence）：某文明某年出现「霜鲸湾渔会」这类组织。
+    - 组织解散（org_dissolve）：某组织卡被清理前存其关键信息，保证删卡后历史一致性。
 
     ``scope`` 给出生效范围；``holds_until`` 留给"暂时性事实"（如停战），
     永久事实为 None。

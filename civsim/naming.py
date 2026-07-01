@@ -21,7 +21,8 @@ from __future__ import annotations
 import random
 from typing import Optional
 
-from .models import Civilization, NamingStyle, Person, SocialClass, VoiceStyle
+from .models import (Civilization, NamingStyle, Organization, OrgType,
+                    Person, SocialClass, VoiceStyle)
 from .providers import GenRequest, LLMProvider
 
 
@@ -50,21 +51,31 @@ class NameGenerator:
         return self._dedupe(civ, names)
 
     def _llm_generate(self, civ: Civilization, count: int, gender: Optional[str]) -> list[str]:
-        """调 LLM 按规范生成名字。要求只返回名字、每行一个。异常/空返回回退 mock。"""
+        """调 LLM 按命名规范即兴生成名字。词库作风格示例，LLM 可创造新词；新词回收进词库。
+
+        设计意图：词库不是封闭选择集，而是「风格种子 + 示例」。LLM 真正按 style_note 的
+        调性即兴创造名字（可参考示例词、也可发明新词根/氏族名），而非在 15 个组合里随机挑——
+        否则等于把 LLM 当随机数生成器用。LLM 造的新词根/氏族，引擎解析回收进 civ.naming，
+        词库随使用增长，后续生成选择面越来越广、撞名率递降。
+        """
         ns = civ.naming
         gender_hint = f"性别倾向：{gender}。" if ns.gendered and gender else ""
         user = (
-            f"请按以下命名规范生成 {count} 个{civ.name}风格的人名。\n"
-            f"风格说明：{ns.style_note or '（无特殊说明）'}\n"
-            f"词根库：{ns.roots}\n前缀库：{ns.prefixes}\n后缀库：{ns.suffixes}\n"
-            f"氏族名库：{ns.clans}\n组合模板：{ns.template}\n{gender_hint}\n"
+            f"请为「{civ.name}」文明即兴创造 {count} 个符合其命名风格的人名。\n"
+            f"命名风格说明：{ns.style_note or '（无特殊说明）'}\n"
+            f"组合结构（模板）：{ns.template}\n"
+            f"风格示例（词根/前缀/后缀/氏族名，仅供参考调性，不限于这些）：\n"
+            f"  词根示例：{ns.roots}\n  前缀示例：{ns.prefixes}\n  后缀示例：{ns.suffixes}\n"
+            f"  氏族名示例：{ns.clans}\n{gender_hint}\n"
+            f"你可以、且应当发明新的词根与氏族名（贴合风格），不要只在示例里挑。\n"
             f"只返回名字，每行一个，不要编号、不要解释。"
         )
         try:
             raw = self.provider.generate(GenRequest(
-                system="你是命名生成器。严格按给定词库与模板风格生成人名，"
-                       "名字需朗朗上口、符合文明气质。只输出名字本身，每行一个。",
-                user=user, context_docs=[], max_tokens=120,
+                system="你是命名生成器。按给定的命名风格说明与结构模板即兴创造人名，"
+                       "名字须贴合该文明的气质与风格说明（如海民喜航海意象、氏族连名、音节短促）。"
+                       "鼓励发明新词根与氏族名，而非仅在示例中挑选。只输出名字本身，每行一个。",
+                user=user, context_docs=[], max_tokens=150,
             ))
         except Exception:
             raw = ""
@@ -74,10 +85,41 @@ class NameGenerator:
             s = line.strip().lstrip("0123456789.、-) ").strip()
             if s and len(s) <= 40:
                 names.append(s)
+        # 回收新词：按 template 结构从生成的名字里拆出新词根/氏族，加进词库。
+        self._recycle_new_lexemes(civ, names)
         # 不足（含空返回/异常）则用 mock 补足，保证数量。
         if len(names) < count:
             names.extend(self._mock_generate(civ, count - len(names)))
         return names[:count]
+
+    def _recycle_new_lexemes(self, civ: Civilization, names: list[str]) -> None:
+        """从 LLM 生成的名字里拆出新词根/氏族，回收进 civ.naming 词库。
+
+        按 template 的占位符结构拆分生成的名字。当前实现针对最常见的
+        ``{root}·{clan}`` / ``{root}`` 结构：以 ``·`` 分段，前段作 root 候选、后段作 clan 候选；
+        无 ``·`` 的整体作 root 候选。仅回收「长度合理、未在词库」的新词，每类上限 30 防
+        词库无限膨胀。这让词库随 LLM 创造而增长，后续生成选择面越来越广。
+        """
+        ns = civ.naming
+        for n in names:
+            if not n or len(n) > 20:
+                continue
+            if "·" in n:
+                parts = [p.strip() for p in n.split("·") if p.strip()]
+                if len(parts) >= 2:
+                    root, clan = parts[0], parts[-1]
+                    if root and root not in ns.roots and len(ns.roots) < 30:
+                        ns.roots.append(root)
+                    if clan and clan not in ns.clans and len(ns.clans) < 30:
+                        # 氏族名常带「氏」尾，规范化：确保以「氏」结尾。
+                        if not clan.endswith("氏"):
+                            clan = clan + "氏"
+                        if clan not in ns.clans:
+                            ns.clans.append(clan)
+            else:
+                # 无分隔符：整体作 root 候选。
+                if n not in ns.roots and len(ns.roots) < 30:
+                    ns.roots.append(n)
 
     def _mock_generate(self, civ: Civilization, count: int) -> list[str]:
         """兜底：从词库随机填充模板占位符组合名字。零配置可跑。"""
@@ -438,3 +480,169 @@ class AppellationJudge:
             return False
         # 模糊：回退规则。
         return _looks_like_appellation(name)
+
+
+# ---------------------------------------------------------------------------
+# 社会组织涌现与清理
+# ---------------------------------------------------------------------------
+
+
+# mock 模式按触发关键词给的兜底组织候选：trigger -> [(name, org_type, 规模说明)]。
+# 与 _MOCK_ROLE_CANDIDATES 同思路：关键事件触发，按情境给契合的组织涌现。
+_MOCK_ORG_CANDIDATES: dict[str, list[tuple[str, OrgType, str]]] = {
+    "tech_bronze": [("铜匠行会", OrgType.GUILD, "青铜冶铸"), ("铸器坊", OrgType.GUILD, "器物铸造")],
+    "tech_iron": [("铁匠行会", OrgType.GUILD, "铁器锻造"), ("兵器坊", OrgType.GUILD, "甲兵打造")],
+    "tech_medieval": [("城堡学堂", OrgType.SCHOOL, "贵族蒙学"), ("行会总会", OrgType.GUILD, "诸行统筹")],
+    "tech_renaissance": [("文华学堂", OrgType.SCHOOL, "人文讲学"), ("测绘院", OrgType.SCHOOL, "星地测绘")],
+    "tech_industrial": [("机巧工场", OrgType.GUILD, "机器制造"), ("实业总会", OrgType.GUILD, "工商统筹")],
+    "gov_monarchy": [("王廷", OrgType.COUNCIL, "王廷议政"), ("近卫军", OrgType.ARMY, "王室亲军")],
+    "gov_republic": [("议事会", OrgType.COUNCIL, "公民议事"), ("民选法庭", OrgType.COUNCIL, "裁断纠纷")],
+    "gov_theocracy": [("教廷", OrgType.CHURCH, "神权中枢"), ("异端裁判所", OrgType.CHURCH, "教义稽查")],
+    "gov_empire": [("行省总督府", OrgType.FIEF, "行省治理"), ("军团", OrgType.ARMY, "征战编制")],
+    "default": [("市集", OrgType.SETTLEMENT, "集市聚落")],
+}
+
+
+class OrgProposer:
+    """在关键事件时提议涌现新社会组织。
+
+    LLM 提议契合文明现状的新组织（名/类型/规模/可选上级），引擎建 Organization 并写
+    ``Fact(kind="org_emergence")``。mock 模式按触发关键词给固定候选。遵循"判断/提议类
+    调用健壮性"约定：max_tokens≥120、try/except、空返回回退 mock。
+    """
+
+    def __init__(self, provider: LLMProvider, rng: random.Random | None = None):
+        self.provider = provider
+        self.rng = rng or random.Random()
+
+    def propose(self, civ: Civilization, trigger: str, count: int = 2) -> list[dict]:
+        """提议 ``count`` 个新组织。返回 [{name, org_type, scale_note, parent_name?}]。
+
+        ``trigger`` 形如 ``"tech_bronze"``/``"gov_monarchy"``。去重：不与已有组织同名。
+        """
+        if self.provider.name == "mock":
+            cands = _MOCK_ORG_CANDIDATES.get(trigger, _MOCK_ORG_CANDIDATES["default"])
+            picked = self.rng.sample(cands, min(count, len(cands)))
+            out = [{"name": n, "org_type": ot.value, "scale_note": s, "parent_name": ""}
+                   for n, ot, s in picked]
+        else:
+            out = self._llm_propose(civ, trigger, count)
+        existing = {o.name for o in civ.organizations}
+        return [d for d in out if d.get("name") and d["name"] not in existing][:count]
+
+    def _llm_propose(self, civ: Civilization, trigger: str, count: int) -> list[dict]:
+        """调 LLM 提议组织，结构化返回。要求每行『组织名|类型|规模说明|上级组织名(可空)』。"""
+        valid_types = {ot.value for ot in OrgType}
+        existing = "; ".join(f"{o.name}({o.org_type.value})" for o in civ.organizations) or "无"
+        user = (
+            f"文明：{civ.name}（政体={civ.government.value}，科技={civ.tech_level.name}，"
+            f"信仰={civ.religion}，人口={civ.population}）。\n"
+            f"触发情境：{trigger}（科技升级/政体更替/人口增长等）。\n"
+            f"已有组织：{existing}\n"
+            f"请提议 {count} 个契合该文明新阶段的新社会组织。类型须从这些里选："
+            f"{sorted(valid_types)}（settlement聚落/church教会/guild行会/school学堂/"
+            f"council议会/fief封地/army军队/other其他）。\n"
+            f"格式：每行『组织名|类型|规模说明|上级组织名(可空)』，不要编号、不要解释。"
+        )
+        try:
+            raw = self.provider.generate(GenRequest(
+                system="你是社会结构生成器。提议契合文明历史阶段的新社会组织，"
+                       "组织名应具体有时代感（如「霜鲸湾渔会」「海灵教会」），不与常见泛称重复。"
+                       "严格按格式输出。",
+                user=user, context_docs=[], max_tokens=200,
+            ))
+        except Exception:
+            raw = ""
+        out: list[dict] = []
+        for line in (raw or "").splitlines():
+            if "|" not in line:
+                continue
+            parts = [p.strip() for p in line.split("|")]
+            while len(parts) < 4:
+                parts.append("")
+            name, otype, scale, parent = parts[0], parts[1].lower(), parts[2], parts[3]
+            name = name.lstrip("0123456789.、-) ").strip()
+            if name and otype in valid_types:
+                out.append({"name": name, "org_type": otype, "scale_note": scale, "parent_name": parent})
+        # 不足则用 mock 补足。
+        if len(out) < count:
+            cands = _MOCK_ORG_CANDIDATES.get(trigger, _MOCK_ORG_CANDIDATES["default"])
+            for n, ot, s in cands:
+                if len(out) >= count:
+                    break
+                out.append({"name": n, "org_type": ot.value, "scale_note": s, "parent_name": ""})
+        return out[:count]
+
+
+class OrgPurger:
+    """判断已解散且长期未提及的组织是否可删卡，防组织卡膨胀。
+
+    与 PersonPurger 对称：已解散且 last_mentioned_year 早于阈值者，LLM 判断是否仍可能被
+    未来文本牵连，可删则引擎先写 Fact(kind="org_dissolve") 存关键信息再删。
+    """
+
+    def __init__(self, provider: LLMProvider, rng: random.Random | None = None):
+        self.provider = provider
+        self.rng = rng or random.Random()
+
+    def should_purge(self, org: Organization) -> bool:
+        """返回是否可删卡。mock 兜底：已解散即可删。空返回保守保留。"""
+        if self.provider.name == "mock":
+            return org.dissolved_year is not None
+        try:
+            raw = self.provider.generate(GenRequest(
+                system="你是组织档案管理者。判断已解散且长期未被提及的组织是否可从活动档案清理"
+                       "（其关键信息已另存既成事实）。只输出『可删』或『保留』。",
+                user=f"组织：{org.name}（{org.org_type.value}），"
+                     f"{org.founded_year}–{org.dissolved_year}年。"
+                     f"经历：{org.history_entries[:3]}。是否可删？",
+                context_docs=[], max_tokens=120,
+            ))
+        except Exception:
+            raw = ""
+        raw = (raw or "").strip()
+        if not raw:
+            return False  # 空返回保守保留
+        return "可删" in raw
+
+
+class OrgMemberInferrer:
+    """按阶层/role/home 推断新人物应归入的组织（CAST 未给所属组织时兜底）。
+
+    推断规则（确定性，mock 与 LLM 模式共用，保证可复现）：
+    - clergy → 该文明一个 CHURCH（无则空）
+    - soldier → 该文明一个 ARMY（无则空）
+    - artisan → 该文明一个 GUILD（无则空）
+    - commoner/nobility → 按 home 匹配 SETTLEMENT（组织名含 home 词根），否则随机 SETTLEMENT
+    - outsider/marginal → 一般不归组织（返回空）
+    命中后建双向成员关系（组织 members + Person.orgs）。
+    """
+
+    # 阶层 → 倾向的组织类型（按此顺序找该文明的同类组织）。
+    _CLASS_TO_TYPE = {
+        SocialClass.CLERGY: [OrgType.CHURCH],
+        SocialClass.SOLDIER: [OrgType.ARMY],
+        SocialClass.ARTISAN: [OrgType.GUILD, OrgType.SETTLEMENT],
+        SocialClass.NOBILITY: [OrgType.FIEF, OrgType.COUNCIL, OrgType.SETTLEMENT],
+        SocialClass.COMMONER: [OrgType.SETTLEMENT, OrgType.GUILD],
+    }
+
+    def __init__(self, rng: random.Random | None = None):
+        self.rng = rng or random.Random()
+
+    def infer(self, civ: Civilization, sclass: SocialClass, role: str, home: str) -> Optional[str]:
+        """返回推断的组织 id，无合适则 None。优先按 home 匹配，否则随机同类。"""
+        types = self._CLASS_TO_TYPE.get(sclass, [])
+        living = [o for o in civ.organizations if o.dissolved_year is None]
+        for ot in types:
+            candidates = [o for o in living if o.org_type == ot]
+            if not candidates:
+                continue
+            # 按 home 匹配：组织名含 home 词根则优先。
+            if home:
+                home_key = home.split("·")[0]
+                for o in candidates:
+                    if home_key and home_key in o.name:
+                        return o.id
+            return self.rng.choice(candidates).id
+        return None

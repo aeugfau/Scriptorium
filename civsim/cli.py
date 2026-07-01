@@ -28,8 +28,8 @@ from rich.table import Table
 from .archive import Archive
 from .engine import Simulation
 from .models import (
-    Biome, Civilization, Era, Event, Government, NamingStyle, Relation,
-    SocialClass, TechLevel, VoiceStyle, World,
+    Biome, Civilization, Era, Event, Government, NamingStyle, Organization,
+    OrgType, Relation, SocialClass, TechLevel, VoiceStyle, World,
 )
 from .providers import get_provider, get_provider_from_config
 
@@ -39,6 +39,37 @@ console = Console()
 # ---------------------------------------------------------------------------
 # 从配置构造世界
 # ---------------------------------------------------------------------------
+
+
+def _build_organizations(civ_cfg: dict, orgs_cfg: list) -> list[Organization]:
+    """从 config 的 organizations 块构造初始组织种子。
+
+    每个组织：name/org_type/parent/ founded_year/status。parent 用名引用，转 id。
+    """
+    orgs: list[Organization] = []
+    # 用配置中的 name 作为内部查找键；id 形如 {civ_id}-org{i}-{founded}。
+    cid = civ_cfg["id"]
+    name_to_id: dict[str, str] = {}
+    for i, o in enumerate(orgs_cfg or [], 1):
+        name = o.get("name", f"组织{i}")
+        oid = f"{cid}-org{i}-{o.get('founded_year', 0)}"
+        name_to_id[name] = oid
+    for i, o in enumerate(orgs_cfg or [], 1):
+        name = o.get("name", f"组织{i}")
+        oid = name_to_id[name]
+        parent = o.get("parent", "")
+        parent_id = name_to_id.get(parent) if parent else None
+        try:
+            ot = OrgType(o.get("org_type", "other"))
+        except Exception:
+            ot = OrgType.OTHER
+        orgs.append(Organization(
+            id=oid, name=name, org_type=ot, civ_id=cid, parent_org_id=parent_id,
+            founded_year=o.get("founded_year", 0), status=o.get("status", "stable"),
+            last_mentioned_year=o.get("founded_year", 0),
+            history_entries=[f"{o.get('founded_year', 0)}年：初始组织种子。"],
+        ))
+    return orgs
 
 
 def build_world(cfg_path: str) -> World:
@@ -79,6 +110,7 @@ def build_world(cfg_path: str) -> World:
                 general=voice_cfg.get("general", "庄重质朴"),
                 by_genre=voice_cfg.get("by_genre", {}),
             ) if (voice_cfg := c.get("voice")) else VoiceStyle(),
+            organizations=_build_organizations(c, c.get("organizations", [])),
         ))
     # 应用外交关系矩阵：双向写入。
     for a, b, rel in cfg.get("relations", []):
@@ -158,8 +190,15 @@ def run(sim: Simulation, archive: Archive) -> None:
         if not cmd:
             continue
         head = cmd[0].lower()
+        cmd_l = cmd.lower()
         try:
-            if head == "n":
+            # 多字母整词命令优先于单字母首字符匹配，避免「save」被「s」拦截。
+            if cmd_l == "save" or cmd_l.startswith("save "):
+                p = cmd.split(maxsplit=1)[1] if " " in cmd else "saves/world.json"
+                Path(p).parent.mkdir(parents=True, exist_ok=True)
+                sim.save(p)
+                console.print(f"[green]已存档至 {p}[/green]")
+            elif head == "n":
                 n = 1
                 if cmd[1:].strip().isdigit():
                     n = max(1, int(cmd[1:].strip()))
@@ -186,11 +225,6 @@ def run(sim: Simulation, archive: Archive) -> None:
                     console.print(f"[green]已清除 {n} 篇档案。[/green]")
                 else:
                     console.print("[dim]已取消。[/dim]")
-            elif cmd.lower().startswith("save"):
-                p = cmd.split(maxsplit=1)[1] if " " in cmd else "saves/world.json"
-                Path(p).parent.mkdir(parents=True, exist_ok=True)
-                sim.save(p)
-                console.print(f"[green]已存档至 {p}[/green]")
             elif head == "q":
                 console.print("[dim]再见，文明永续。[/dim]")
                 break

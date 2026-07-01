@@ -22,10 +22,10 @@ civs:
     social_classes: [nobility, commoner, artisan, soldier]   # 初始已解锁核心阶层
     role_pool: [航海长, 渔会首脑, 海灵祭司]                   # 初始身份种子，后续靠 LLM 涌现扩充
     naming:
-      roots: [萨尔, 诺, 伊尔, 汀, 维恩]                      # 名字核心音节/意象
+      roots: [萨尔, 诺, 伊尔, 汀, 维恩, 洛克, 费恩, 瓦尔, 斯格, 图林, 布里, 海尔姆]   # 风格示例，LLM 可发明新词并自动回收扩充
       prefixes: []
       suffixes: []
-      clans: [霜鲸氏, 浪鸦氏, 锚石氏]                        # 氏族名
+      clans: [霜鲸氏, 浪鸦氏, 锚石氏, 潮汐氏, 破浪氏, 鲸骨氏, 海风氏, 沉礁氏]
       template: "{root}·{clan}"                              # 组合模板（支持 {prefix}/{root}/{suffix}/{clan}/{ordinal}）
       style_note: 海民命名喜航海与海兽意象，常以氏族连名，音节短促有力
       gendered: false
@@ -37,6 +37,15 @@ civs:
         scripture: 经文多颂海灵与鲸神，语带潮汐韵律
         diary: 日记口语化，常提渔获、海况、出海见闻
         minutes: 议事纪要条目化，多议航海、分配、战备
+    organizations:                              # 初始社会组织种子，后续靠 LLM 涌现扩充
+      - name: 霜鲸湾
+        org_type: settlement
+        founded_year: 0
+        status: stable
+      - name: 海灵教会
+        org_type: church
+        founded_year: 0
+        status: stable
   - id: verdia
     name: 翠地亚
     biome: plains
@@ -51,10 +60,10 @@ civs:
     social_classes: [commoner, artisan, marginal]
     role_pool: [陶工, 祭祖长老, 守田人]
     naming:
-      roots: [穆, 卡, 苏, 岚, 达]
+      roots: [穆, 卡, 苏, 岚, 达, 禾青, 禾实, 谷梁, 田仲, 陶生, 泥根, 壤伯]
       prefixes: []
       suffixes: []
-      clans: [禾氏, 陶氏, 泥氏]
+      clans: [禾氏, 陶氏, 泥氏, 壤氏, 谷氏, 井氏, 塬氏, 陇氏]
       template: "{root}·{clan}"
       style_note: 农耕民命名尚土地与谷物意象，多以职业或氏族连名，质朴平和
       gendered: false
@@ -66,6 +75,15 @@ civs:
         scripture: 经文颂地母与谷灵，语带泥土与生长意象
         diary: 日记口语化，常提天气、农活、收成、邻里
         minutes: 议事纪要条目化，多议农时、水源、祭祖分配
+    organizations:
+      - name: 禾原
+        org_type: settlement
+        founded_year: 0
+        status: stable
+      - name: 地母教会
+        org_type: church
+        founded_year: 0
+        status: stable
 
 # Initial diplomatic stance matrix (optional; missing pairs default to neutral).
 relations:
