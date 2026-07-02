@@ -265,10 +265,15 @@ class ArtifactFactory:
                          year: int, genre: str, author: Optional[Person] = None) -> list[str]:
         """归并/建档文本中出现的人物，返回其 Person.id 列表。
 
-        按「标准名 + 文明」匹配已存在 Person：命中则补全空字段、更新 last_mentioned_year、
+        按「标准名 + 全文明」匹配已存在 Person：命中则补全空字段、更新 last_mentioned_year、
         记 mentioned_in、追加本篇经历；未命中则新建 commoner 卡。标准名优先取 CAST 的
         ``canonical`` 列（LLM 给的稳定全名），回退到 ``name``——这让同一人即便文中用不同
         称谓（穆·禾氏 / 老穆 / 二叔）也能识别为同一卡。
+
+        **跨文明匹配**：LLM 写 A 文明日记时可能提及 B 文明的人物（人类也会这样——「想起
+        诺尔海姆那位海灵祭司」），若只在本文明内按名查找，会在 B 文明重建一张同名卡，
+        导致同一人物分裂为两个文明各一份。修正为：先在目标文明查找，找不到则搜全文明；
+        命中其他文明的人物时，沿用其卡（追加经历/更新提及），不建重复卡。
 
         若传入 ``author``：对每个 CAST 行带「与作者关系类型」的，建双向结构化关系边——
         author.relations[other_id]=rel，other.relations[author_id]=inverse(rel)。
@@ -277,6 +282,25 @@ class ArtifactFactory:
         from .models import SocialClass as _SC, inverse_relation
         ids: list[str] = []
         judge = getattr(self, "_appellation_judge", None)
+
+        def _find_by_name(key: str) -> Optional[Person]:
+            """在目标文明及全文明中按名查找人物。优先目标文明，其次全文明。
+            跨文明匹配防止 LLM 在 A 文明文本中提及 B 文明人物时重复建卡。"""
+            if not key:
+                return None
+            # 先在目标文明找（常见情况）。
+            for p in civ.people:
+                if p.name == key:
+                    return p
+            # 再跨文明找——LLM 写 A 文明文本时可能提及 B 文明人物。
+            for oc in w.civs:
+                if oc.id == civ.id:
+                    continue
+                for p in oc.people:
+                    if p.name == key:
+                        return p
+            return None
+
         for s in specs:
             name = (s.get("name") or "").strip()
             canonical = (s.get("canonical") or "").strip()
@@ -299,10 +323,11 @@ class ArtifactFactory:
                 # 无标准名但带关系：建一张新卡（名字由 register 生成），仍挂关系。
                 if not (s.get("relation") or "").strip():
                     continue
-            existing = next((p for p in civ.people if p.name == key), None) if key else None
-            # 也按 canonical 在已有卡里找（防止 canonical 是别名、name 是建卡名的情况）。
+            # 先在目标文明查，再跨文明查（防 LLM 在 A 文明文本提 B 文明人物时重卡）。
+            existing = _find_by_name(key)
+            # 也按 canonical 在全文明已有卡里找（防止 canonical 是别名、name 是建卡名的情况）。
             if existing is None and key and canonical and not canon_is_appe:
-                existing = next((p for p in civ.people if canonical == p.name), None)
+                existing = _find_by_name(canonical)
             bio_event = (s.get("bio_event") or "").strip()
             if existing:
                 # 补全空字段（不覆盖已有权威信息）。

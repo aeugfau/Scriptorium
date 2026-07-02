@@ -833,19 +833,27 @@ class Simulation:
         if not name:
             names = self.name_gen.generate(c, count=1, gender=gender if c.naming.gendered else None)
             name = names[0] if names else "某人"
-        # 跨时间同名防护：若该文明已有同名人物（含已故未清理），加序号后缀避免新角色
-        # 冒充旧人致年龄/经历矛盾（如「汀·锚石氏」4年老人 + 94年同名新人被误认为同一人）。
-        # 注意：归并命中已有在世同名的场景不在 register（走 _resolve_persons 的 existing 分支），
+        # 跨时间 + 跨文明同名防护：先查本文明（含已故未清理），再查全文明。
+        # 若另一文明已有同名人物，加序号后缀避免新角色冒充旧人致年龄/经历矛盾。
+        # 归并命中已有在世同名的场景不在 register（走 _resolve_persons 的 existing 分支），
         # 故此处只可能是「真新角色撞了旧名」——加序号区分。
         existing_same = [p for p in c.people if p.name == name]
+        if not existing_same:
+            for oc in self.world.civs:
+                if oc.id == c.id:
+                    continue
+                existing_same = [p for p in oc.people if p.name == name]
+                if existing_same:
+                    break
         if existing_same:
             ordinals = ["", "·二", "·三", "·四", "·五", "·六", "·七"]
-            i = 1
             for o in ordinals[1:]:
-                if not any(p.name == f"{name}{o}" for p in c.people):
-                    name = f"{name}{o}"
+                # 序号去重也要跨文明查，确保「·二」在另一文明也不存在。
+                candidate = f"{name}{o}"
+                collision = any(p.name == candidate for civ2 in self.world.civs for p in civ2.people)
+                if not collision:
+                    name = candidate
                     break
-                i += 1
         if not gender:
             gender = self.rng.choice(["男", "女"])
         _, cap_lo, cap_hi = LIFESPAN_BY_TECH.get(c.tech_level, (50, 60, 75))
