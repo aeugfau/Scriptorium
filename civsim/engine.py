@@ -672,7 +672,7 @@ class Simulation:
                 if "动荡" in title:
                     event_risks.setdefault(cid, []).append((0.12, "动乱"))
 
-        ACCIDENT_BASE = 0.006  # 每 tick 基础意外概率（乘风险倍率后约 0.2%~2%/tick）
+        ACCIDENT_BASE = 0.02   # 每 tick 基础意外概率（乘风险倍率后约 0.7%~9%/tick）。
         for c in w.civs:
             triggers = event_risks.get(c.id, [])
             for p in list(c.people):
